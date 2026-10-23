@@ -1,7 +1,8 @@
 import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import type { ComputerAction, ComputerResult } from '@pocket/protocol';
+import type { ComputerAction, ComputerResult, ScreenImage } from '@pocket/protocol';
 import { keyCode, parseKeys } from './keys.js';
+import type { ScreenWatchHost, WatchCapture, WatchSample } from './watch.js';
 
 /** Computer use on this machine: one step at a time, in physical desktop pixels. */
 export interface ComputerBackend {
@@ -30,6 +31,8 @@ export type HostCommand =
   | { op: 'windows' }
   | { op: 'window'; handle: string; what: string }
   | { op: 'open'; target: string; args: string }
+  | { op: 'watchSample'; display: number }
+  | { op: 'watchCapture'; display: number }
   | { op: 'release' };
 
 const mods = (names: readonly string[] | undefined) => (names ?? []).map((n) => keyCode(n));
@@ -81,6 +84,7 @@ export function timeoutFor(c: HostCommand): number {
  * of JSON lines. Per-monitor DPI awareness keeps every coordinate in physical pixels. ASCII only and no backticks:
  * PowerShell reads a BOM-less file in the ANSI code page, and this lives in a template literal.
  */
+/** Add-Type in Windows PowerShell 5.1 compiles C# 5; keep the helper free of newer syntax and unsafe code. */
 export const COMPUTER_PS = String.raw`
 $ErrorActionPreference = 'Stop'
 [Console]::InputEncoding = [Text.Encoding]::UTF8
@@ -147,6 +151,14 @@ public static class PocketComputer {
   [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr h, int index);
   [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
   [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll", SetLastError = true)] static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint access);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool GetUserObjectInformation(IntPtr handle, int index, StringBuilder info, int length, out int needed);
+  [DllImport("user32.dll", SetLastError = true)] static extern bool CloseDesktop(IntPtr handle);
+  [DllImport("user32.dll", SetLastError = true)] static extern IntPtr GetDC(IntPtr handle);
+  [DllImport("user32.dll", SetLastError = true)] static extern int ReleaseDC(IntPtr handle, IntPtr dc);
+  [DllImport("gdi32.dll", SetLastError = true)] static extern int SetStretchBltMode(IntPtr dc, int mode);
+  [DllImport("gdi32.dll", SetLastError = true)] static extern bool SetBrushOrgEx(IntPtr dc, int x, int y, IntPtr old);
+  [DllImport("gdi32.dll", SetLastError = true)] static extern bool StretchBlt(IntPtr dst, int dx, int dy, int dw, int dh, IntPtr src, int sx, int sy, int sw, int sh, uint rop);
   [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr h);
   [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
@@ -302,6 +314,87 @@ public static class PocketComputer {
     if (i >= mons.Count) throw new ArgumentException("There is no display " + display + ": this computer has " + mons.Count + ".");
     RECT r = mons[i].R;
     return "{" + Capture(r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top, maxW, maxH) + ",\"displays\":" + DisplaysJson(mons) + ",\"cursor\":" + CursorJson() + "}";
+  }
+
+  static bool InputDesktopLocked() {
+    IntPtr desktop = OpenInputDesktop(0, false, 1);
+    if (desktop == IntPtr.Zero) return true;
+    try {
+      StringBuilder name = new StringBuilder(128);
+      int needed;
+      if (!GetUserObjectInformation(desktop, 2, name, name.Capacity * 2, out needed)) return true;
+      return !string.Equals(name.ToString(), "Default", StringComparison.OrdinalIgnoreCase);
+    } finally { CloseDesktop(desktop); }
+  }
+
+  static string ForegroundMetadata() {
+    IntPtr h = GetForegroundWindow();
+    int length = h == IntPtr.Zero ? 0 : Math.Min(2048, GetWindowTextLength(h));
+    StringBuilder title = new StringBuilder(length + 1);
+    if (length > 0) GetWindowText(h, title, title.Capacity);
+    uint pid = 0;
+    if (h != IntPtr.Zero) GetWindowThreadProcessId(h, out pid);
+    string process = "";
+    if (pid != 0) {
+      try { using (Process p = Process.GetProcessById((int)pid)) process = p.ProcessName; }
+      catch (ArgumentException) { } catch (InvalidOperationException) { } catch (Win32Exception) { }
+    }
+    return "\"windowTitle\":" + Q(title.ToString()) + ",\"processName\":" + Q(process);
+  }
+
+  static byte[] GraySample(RECT r) {
+    const int width = 160, height = 90;
+    using (Bitmap bitmap = new Bitmap(width, height, PixelFormat.Format32bppRgb)) {
+      using (Graphics graphics = Graphics.FromImage(bitmap)) {
+        IntPtr dst = graphics.GetHdc();
+        try {
+          IntPtr src = GetDC(IntPtr.Zero);
+          if (src == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not read the desktop");
+          try {
+            SetStretchBltMode(dst, 4);
+            SetBrushOrgEx(dst, 0, 0, IntPtr.Zero);
+            if (!StretchBlt(dst, 0, 0, width, height, src, r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top, 0x00CC0020))
+              throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not sample the desktop");
+          } finally { ReleaseDC(IntPtr.Zero, src); }
+        } finally { graphics.ReleaseHdc(dst); }
+      }
+      BitmapData data = bitmap.LockBits(new Rectangle(0, 0, width, height), ImageLockMode.ReadOnly, PixelFormat.Format32bppRgb);
+      try {
+        int stride = Math.Abs(data.Stride);
+        byte[] rgba = new byte[stride * height];
+        byte[] gray = new byte[width * height];
+        Marshal.Copy(data.Scan0, rgba, 0, rgba.Length);
+        for (int y = 0; y < height; y++) {
+          int row = data.Stride >= 0 ? y * stride : (height - 1 - y) * stride;
+          for (int x = 0; x < width; x++) {
+            int i = row + x * 4;
+            gray[y * width + x] = (byte)((rgba[i + 2] * 299 + rgba[i + 1] * 587 + rgba[i] * 114) / 1000);
+          }
+        }
+        return gray;
+      } finally { bitmap.UnlockBits(data); }
+    }
+  }
+
+  public static string WatchSample(int display) {
+    if (InputDesktopLocked()) return "{\"locked\":true}";
+    List<Display> mons = Displays();
+    if (display >= mons.Count) throw new ArgumentException("There is no display " + display + ".");
+    RECT r = mons[display].R;
+    byte[] sample = GraySample(r);
+    if (InputDesktopLocked()) return "{\"locked\":true}";
+    return "{\"locked\":false,\"pixelsBase64\":" + Q(Convert.ToBase64String(sample))
+      + ",\"width\":160,\"height\":90,\"display\":" + display + "," + ForegroundMetadata() + "}";
+  }
+
+  public static string WatchCapture(int display) {
+    if (InputDesktopLocked()) return "{\"locked\":true}";
+    List<Display> mons = Displays();
+    if (display >= mons.Count) throw new ArgumentException("There is no display " + display + ".");
+    RECT r = mons[display].R;
+    string image = Capture(r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top, 1280, 800);
+    if (InputDesktopLocked()) return "{\"locked\":true}";
+    return "{\"locked\":false," + image + ",\"display\":" + display + "," + ForegroundMetadata() + "}";
   }
 
   public static string Zoom(int x, int y, int w, int h, int maxW, int maxH) {
@@ -621,6 +714,8 @@ function Codes($v) { if ($null -eq $v) { return ,([int[]]@()) }; return ,([int[]
 function Invoke-Op($c) {
   switch ([string]$c.op) {
     'screenshot' { return [PocketComputer]::Screenshot((Num $c.display -1), (Num $c.maxWidth 1280), (Num $c.maxHeight 800)) }
+    'watchSample' { return [PocketComputer]::WatchSample((Num $c.display 0)) }
+    'watchCapture' { return [PocketComputer]::WatchCapture((Num $c.display 0)) }
     'zoom' { return [PocketComputer]::Zoom([int]$c.x, [int]$c.y, [int]$c.width, [int]$c.height, (Num $c.maxWidth 1600), (Num $c.maxHeight 1200)) }
     'move' { return [PocketComputer]::Move([int]$c.x, [int]$c.y) }
     'click' { return [PocketComputer]::Click((Num $c.x 0), (Num $c.y 0), [bool]$c.at, [string]$c.button, (Num $c.count 1), (Codes $c.mods)) }
@@ -673,14 +768,17 @@ const POWERSHELL = { command: 'powershell.exe', args: ['-NoProfile', '-NonIntera
 const START_TIMEOUT_MS = 60_000;
 
 type Pending = { resolve: (r: ComputerResult) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> };
+type RawWatchSample = { locked: boolean; pixelsBase64?: string; width?: number; height?: number };
+type RawWatchCapture = { locked: boolean; image?: ScreenImage; windowTitle?: string; processName?: string; display?: number };
 
 /** Keeps the PowerShell host running and feeds it one step at a time. */
-export class ComputerHost implements ComputerBackend {
+export class ComputerHost implements ComputerBackend, ScreenWatchHost {
   private child: ChildProcess | undefined;
   private starting: Promise<ChildProcess> | undefined;
   private readonly pending = new Map<number, Pending>();
   private nextId = 1;
   private chain: Promise<unknown> = Promise.resolve();
+  private queued = 0;
   /** Bumped by release(): steps queued before it are dropped. */
   private epoch = 0;
   private inFlight = 0;
@@ -709,9 +807,38 @@ export class ComputerHost implements ComputerBackend {
         this.inFlight--;
       }
     };
-    const run = this.chain.then(step, step);
-    this.chain = run.catch(() => undefined);
-    return run;
+    return this.enqueue(step);
+  }
+
+  sample(display: number): Promise<WatchSample> {
+    return this.watchCall({ op: 'watchSample', display }).then((value) => {
+      const result = value as ComputerResult & RawWatchSample;
+      if (result.locked) return { locked: true };
+      if (typeof result.pixelsBase64 !== 'string' || result.width !== 160 || result.height !== 90) {
+        throw new Error('The computer returned an invalid screen sample');
+      }
+      const pixels = Uint8Array.from(Buffer.from(result.pixelsBase64, 'base64'));
+      if (pixels.length !== result.width * result.height) throw new Error('The computer returned an incomplete screen sample');
+      return { locked: false, pixels, width: result.width, height: result.height };
+    });
+  }
+
+  capture(display: number): Promise<WatchCapture> {
+    return this.watchCall({ op: 'watchCapture', display }).then((value) => {
+      const result = value as ComputerResult & RawWatchCapture;
+      if (result.locked) return { locked: true };
+      const image = result.image;
+      if (!image || image.mime !== 'image/jpeg' || !image.dataBase64 || image.dataBase64.length > 4_000_000 ||
+        image.width < 1 || image.height < 1 || image.width > 1280 || image.height > 800 ||
+        typeof result.windowTitle !== 'string' || typeof result.processName !== 'string' || !Number.isInteger(result.display) || result.display! < 0) {
+        throw new Error('The computer returned an invalid watch frame');
+      }
+      return { locked: false, image: { ...image, mime: 'image/jpeg' }, windowTitle: result.windowTitle, processName: result.processName, display: result.display };
+    });
+  }
+
+  isBusy(): boolean {
+    return this.queued > 0;
   }
 
   release(): void {
@@ -741,6 +868,26 @@ export class ComputerHost implements ComputerBackend {
           child.stdin?.write(`${JSON.stringify({ id, cmd })}\n`);
         }),
     );
+  }
+
+  private watchCall(cmd: HostCommand): Promise<ComputerResult> {
+    const epoch = this.epoch;
+    return this.enqueue(async () => {
+      if (epoch !== this.epoch) throw new Error('Stopped by the user.');
+      this.inFlight++;
+      try {
+        return await this.call(cmd, 20_000);
+      } finally {
+        this.inFlight--;
+      }
+    });
+  }
+
+  private enqueue<T>(step: () => Promise<T>): Promise<T> {
+    this.queued++;
+    const run = this.chain.then(step, step).finally(() => { this.queued--; });
+    this.chain = run.catch(() => undefined);
+    return run;
   }
 
   private ensure(): Promise<ChildProcess> {
