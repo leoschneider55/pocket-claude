@@ -4,6 +4,7 @@ import { DeviceLink, type IncomingMessage, type WebSocketCtor } from '@pocket/tr
 import type { ClipboardBackend } from './clipboard.js';
 import type { ComputerBackend } from './computer.js';
 import type { ScreenBackend } from './screenshot.js';
+import { ScreenWatchController, type ScreenWatchHost } from './watch.js';
 
 export interface AgentState {
   relayUrl: string;
@@ -31,6 +32,7 @@ export interface OverlaySink {
 /** Shares this computer's clipboard and screen with the paired Mac and, when allowed, its mouse and keyboard; no files, no commands. */
 export class ClipboardAgent {
   private readonly link: DeviceLink;
+  private readonly watch: ScreenWatchController | undefined;
   private overlay: OverlaySink | undefined;
 
   constructor(
@@ -41,6 +43,8 @@ export class ClipboardAgent {
       screen?: ScreenBackend;
       /** Computer use: screen, mouse, keyboard and windows; absent means the computer does not offer it. */
       computer?: ComputerBackend;
+      /** Read-only screen watch backed by the persistent Windows computer host. */
+      watch?: ScreenWatchHost;
       WebSocket?: WebSocketCtor;
       log: (m: string) => void;
       /** The relay moved; the caller persists the new address. */
@@ -65,8 +69,21 @@ export class ClipboardAgent {
     this.link.on('presence', (id, online) => {
       if (id !== state.brainDeviceId) return;
       if (online) this.sendStatus();
-      else this.overlay?.offline();
+      else {
+        this.watch?.stop('offline');
+        this.overlay?.offline();
+      }
     });
+    this.watch = opts.watch
+      ? new ScreenWatchController({
+          deviceId: state.deviceId,
+          host: opts.watch,
+          isOnline: () => this.link.isOnline(state.brainDeviceId),
+          sendFrame: (frame) => this.send({ type: 'screen.watch.frame', payload: frame }),
+          sendStatus: (status) => this.onWatchStatus(status),
+          log: opts.log,
+        })
+      : undefined;
   }
 
   connect(): void {
@@ -74,6 +91,7 @@ export class ClipboardAgent {
   }
 
   close(): void {
+    this.watch?.close();
     this.link.close();
   }
 
@@ -97,9 +115,41 @@ export class ClipboardAgent {
   }
 
   private sendStatus(): void {
-    const capabilities = ['clipboard', ...(this.opts.screen ? ['screenshot'] : []), ...(this.opts.computer ? ['computer'] : []), ...(this.overlay ? ['overlay'] : [])];
-    this.send({ type: 'executor.status', payload: { workspaces: [], os: `${os.platform()} ${os.release()}`, shell: 'none', capabilities } });
+    this.sendExecutorStatus();
     this.overlay?.connected();
+  }
+
+  private sendExecutorStatus(): void {
+    const capabilities = [
+      'clipboard',
+      ...(this.opts.screen ? ['screenshot'] : []),
+      ...(this.opts.computer ? ['computer'] : []),
+      ...(this.overlay ? ['overlay'] : []),
+      ...(this.opts.watch ? ['watch'] : []),
+    ];
+    const watch = this.watch?.status;
+    this.send({
+      type: 'executor.status',
+      payload: {
+        workspaces: [],
+        os: `${os.platform()} ${os.release()}`,
+        shell: 'none',
+        capabilities,
+        ...(watch ? { watch } : {}),
+      },
+    });
+  }
+
+  private onWatchStatus(status: NonNullable<ScreenWatchController['status']>): void {
+    const message = { type: 'screen.watch.status' as const, payload: status };
+    this.overlay?.handle(message);
+    if (!this.link.isOnline(this.state.brainDeviceId)) return;
+    try {
+      this.send(message);
+      this.sendExecutorStatus();
+    } catch (error) {
+      this.opts.log(`screen watch status failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   private async onMessage({ from, message }: IncomingMessage): Promise<void> {
