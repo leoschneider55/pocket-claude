@@ -1,10 +1,10 @@
 import { Ionicons } from '@expo/vector-icons';
 import type { ChatItem } from '@pocket/client-core';
-import type { PermissionDecision } from '@pocket/protocol';
+import { DEFAULT_SCREEN_WATCH_SETTINGS, type PermissionDecision, type ScreenWatchSettings } from '@pocket/protocol';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
-import { ActivityIndicator, FlatList, Keyboard, KeyboardAvoidingView, Pressable, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, FlatList, Keyboard, KeyboardAvoidingView, Modal, Pressable, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Avatar } from '../../src/components/Avatar';
 import { ChatRow } from '../../src/components/ChatRow';
@@ -42,6 +42,9 @@ function ThreadHeader({
   subtitleColor,
   onCall,
   onVideo,
+  onWatch,
+  watching = false,
+  watchDisabled = false,
   onSubtitle,
 }: {
   avatar: ReactNode;
@@ -50,6 +53,9 @@ function ThreadHeader({
   subtitleColor?: string;
   onCall?: () => void;
   onVideo?: () => void;
+  onWatch?: () => void;
+  watching?: boolean;
+  watchDisabled?: boolean;
   /** The status line names the computer; tapping it opens the computer picker. */
   onSubtitle?: () => void;
 }) {
@@ -77,6 +83,15 @@ function ThreadHeader({
       <Pressable onPress={onVideo} disabled={!onVideo} hitSlop={10} accessibilityLabel="Activity">
         <Ionicons name="videocam-outline" size={27} color={colors.text} />
       </Pressable>
+      <Pressable
+        onPress={onWatch}
+        disabled={!onWatch || watchDisabled}
+        hitSlop={10}
+        accessibilityRole="button"
+        accessibilityLabel={watching ? 'Перестать смотреть экран' : 'Смотреть экран'}
+      >
+        <Ionicons name={watching ? 'eye' : 'eye-outline'} size={25} color={watching ? colors.accent : watchDisabled ? colors.textMuted : colors.text} />
+      </Pressable>
     </View>
   );
 }
@@ -94,11 +109,17 @@ function ClaudeThread({ id }: { id: string }) {
   const brainOnline = useChatSelector((s) => s.brainOnline);
   const models = useChatSelector((s) => s.models);
   const computers = useChatSelector((s) => s.computers);
+  const activeComputer = useChatSelector((s) => s.activeComputer);
   const keyboardVisible = useKeyboardVisible();
+  const [watchSettingsOpen, setWatchSettingsOpen] = useState(false);
+  const [watchDraft, setWatchDraft] = useState<ScreenWatchSettings>({ ...DEFAULT_SCREEN_WATCH_SETTINGS });
 
   const permissions = useMemo(() => allPermissions.filter((p) => p.sessionId === id), [allPermissions, id]);
   const persona = useMemo(() => personaFor(id), [id]);
-  const data = useMemo(() => [...thread].reverse(), [thread]);
+  const data = useMemo(
+    () => thread.filter((item) => !(item.type === 'user' && item.observation) && !(item.type === 'assistant' && item.observation && item.streaming) && !(item.type === 'result' && item.observation)).reverse(),
+    [thread],
+  );
   const running = session?.state === 'running' || session?.state === 'waiting_permission';
   const updatedAt = session?.updatedAt ?? 0;
 
@@ -118,6 +139,35 @@ function ClaudeThread({ id }: { id: string }) {
   useEffect(() => {
     if (client && connection === 'online' && brainOnline && models.length === 0) client.loadModels();
   }, [client, connection, brainOnline, models.length]);
+
+  const watchSettings = session?.watch?.settings ?? DEFAULT_SCREEN_WATCH_SETTINGS;
+  const watching = session?.watch?.state === 'watching' || session?.watch?.state === 'paused';
+  const canWatch = client?.canWatchScreen(id) ?? false;
+  const watchComputerId = session?.executorId ?? activeComputer;
+  const watchComputer = computers.find((c) => c.deviceId === watchComputerId);
+  const watchLine = session?.watch?.state === 'watching' ? '👁 Claude смотрит экран' : session?.watch?.state === 'paused' ? '👁 Наблюдение приостановлено' : null;
+
+  useEffect(() => {
+    if (!watchSettingsOpen) setWatchDraft({ ...watchSettings });
+  }, [id, watchSettings, watchSettingsOpen]);
+
+  const openWatchSettings = () => {
+    setWatchDraft({ ...watchSettings });
+    setWatchSettingsOpen(true);
+  };
+
+  const toggleWatch = () => {
+    client?.setScreenWatch(id, !watching, !watching ? { settings: watchSettings } : {});
+  };
+
+  const adjustWatchSetting = (key: 'intervalMs' | 'maxPerMinute' | 'maxPerHour' | 'retainFrames', delta: number, min: number, max: number) => {
+    setWatchDraft((current) => ({ ...current, [key]: Math.max(min, Math.min(max, current[key] + delta)) }));
+  };
+
+  const saveWatchSettings = () => {
+    if (!client?.setScreenWatch(id, watching, { settings: watchDraft })) return;
+    setWatchSettingsOpen(false);
+  };
 
   const actions = useMemo<ComposerActions>(
     () => ({
@@ -165,18 +215,33 @@ function ClaudeThread({ id }: { id: string }) {
             : computer.online
               ? `Active now · ${computer.name}${projectName ? ` · ${projectName}` : ''}`
               : `${computer.name} offline`;
+  const headerStatus = watchLine ? `${watchLine}${status ? ` · ${status}` : ''}` : status;
 
   return (
     <KeyboardAvoidingView style={styles.root} behavior="padding">
       <ThreadHeader
         avatar={<ClaudeAvatar size={36} active={active} persona={persona} />}
         title={persona.name}
-        subtitle={status}
+        subtitle={headerStatus}
         subtitleColor={session?.state === 'waiting_permission' ? colors.warn : undefined}
         onCall={() => router.push({ pathname: '/direct/call', params: { id } })}
         onVideo={actions.agents}
+        onWatch={toggleWatch}
+        watching={watching}
+        watchDisabled={!watching && !canWatch}
         onSubtitle={() => router.push({ pathname: '/direct/computers', params: { sessionId: id } })}
       />
+
+      {watching || canWatch ? (
+        <View style={styles.watchBar}>
+          <Text style={styles.watchBarText} numberOfLines={1}>
+            {watchLine ?? `👁 Наблюдение выключено · ${watchComputer?.name ?? 'ПК'}`}
+          </Text>
+          <Pressable onPress={openWatchSettings} hitSlop={8} accessibilityRole="button" accessibilityLabel="Настройки наблюдения">
+            <Ionicons name="settings-outline" size={20} color={colors.textMuted} />
+          </Pressable>
+        </View>
+      ) : null}
 
       <FlatList
         data={data}
@@ -203,13 +268,96 @@ function ClaudeThread({ id }: { id: string }) {
         }
       />
 
-      <View style={[styles.bottom, { paddingBottom: keyboardVisible ? 8 : insets.bottom + 8 }]}>
+      <View style={[styles.bottom, { paddingBottom: keyboardVisible ? 8 : insets.bottom + 8 }]}> 
         {permissions.map((p) => (
           <PermissionCard key={p.requestId} request={p} onRespond={respond} />
         ))}
         <ClaudeComposer running={running} session={session} models={models} actions={actions} />
       </View>
+
+      <Modal visible={watchSettingsOpen} transparent animationType="fade" onRequestClose={() => setWatchSettingsOpen(false)}>
+        <View style={styles.watchModal}>
+          <Pressable style={StyleSheet.absoluteFill} onPress={() => setWatchSettingsOpen(false)} accessibilityLabel="Закрыть настройки" />
+          <View style={styles.watchSettingsCard}>
+            <Text style={styles.watchSettingsTitle}>Настройки наблюдения</Text>
+            <WatchSettingRow
+              label="Интервал"
+              value={watchDraft.intervalMs}
+              display={`${(watchDraft.intervalMs / 1000).toFixed(2).replace(/0+$/, '').replace(/\.$/, '')} с`}
+              step={250}
+              min={500}
+              max={3000}
+              onChange={(delta) => adjustWatchSetting('intervalMs', delta, 500, 3000)}
+            />
+            <WatchSettingRow
+              label="Лимит в минуту"
+              value={watchDraft.maxPerMinute}
+              step={1}
+              min={1}
+              max={4}
+              onChange={(delta) => adjustWatchSetting('maxPerMinute', delta, 1, 4)}
+            />
+            <WatchSettingRow
+              label="Лимит в час"
+              value={watchDraft.maxPerHour}
+              step={1}
+              min={1}
+              max={60}
+              onChange={(delta) => adjustWatchSetting('maxPerHour', delta, 1, 60)}
+            />
+            <WatchSettingRow
+              label="Кадров в истории"
+              value={watchDraft.retainFrames}
+              step={1}
+              min={1}
+              max={10}
+              onChange={(delta) => adjustWatchSetting('retainFrames', delta, 1, 10)}
+            />
+            <View style={styles.watchSettingsActions}>
+              <Pressable onPress={() => setWatchSettingsOpen(false)} accessibilityRole="button">
+                <Text style={styles.watchCancel}>Отмена</Text>
+              </Pressable>
+              <Pressable onPress={saveWatchSettings} accessibilityRole="button">
+                <Text style={styles.watchSave}>Сохранить</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </KeyboardAvoidingView>
+  );
+}
+
+function WatchSettingRow({
+  label,
+  value,
+  display = String(value),
+  step,
+  min,
+  max,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  display?: string;
+  step: number;
+  min: number;
+  max: number;
+  onChange: (delta: number) => void;
+}) {
+  return (
+    <View style={styles.watchSettingRow}>
+      <Text style={styles.watchSettingLabel}>{label}</Text>
+      <View style={styles.watchStepper}>
+        <Pressable onPress={() => onChange(-step)} disabled={value <= min} style={styles.watchStepButton} accessibilityLabel={`Уменьшить: ${label}`}>
+          <Text style={styles.watchStepText}>−</Text>
+        </Pressable>
+        <Text style={styles.watchValue}>{display}</Text>
+        <Pressable onPress={() => onChange(step)} disabled={value >= max} style={styles.watchStepButton} accessibilityLabel={`Увеличить: ${label}`}>
+          <Text style={styles.watchStepText}>+</Text>
+        </Pressable>
+      </View>
+    </View>
   );
 }
 
@@ -269,6 +417,20 @@ const styles = StyleSheet.create({
   headerText: { flex: 1 },
   title: { color: colors.text, fontSize: 16, fontWeight: '600' },
   subtitle: { color: colors.textMuted, fontSize: 12, marginTop: 1 },
+  watchBar: { minHeight: 36, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: colors.surface },
+  watchBarText: { flex: 1, color: colors.textMuted, fontSize: 12, marginRight: 10 },
+  watchModal: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 24, backgroundColor: 'rgba(0,0,0,0.66)' },
+  watchSettingsCard: { width: '100%', maxWidth: 420, padding: 20, borderRadius: 18, backgroundColor: colors.surface, gap: 15 },
+  watchSettingsTitle: { color: colors.text, fontSize: 18, fontWeight: '700', marginBottom: 2 },
+  watchSettingRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 12 },
+  watchSettingLabel: { flex: 1, color: colors.text, fontSize: 14 },
+  watchStepper: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  watchStepButton: { width: 34, height: 34, borderRadius: 17, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.bubble },
+  watchStepText: { color: colors.text, fontSize: 20, lineHeight: 23 },
+  watchValue: { minWidth: 42, color: colors.text, fontSize: 14, textAlign: 'center', fontVariant: ['tabular-nums'] },
+  watchSettingsActions: { flexDirection: 'row', justifyContent: 'flex-end', alignItems: 'center', gap: 24, marginTop: 4 },
+  watchCancel: { color: colors.textMuted, fontSize: 15, fontWeight: '600', paddingVertical: 6 },
+  watchSave: { color: colors.accent, fontSize: 15, fontWeight: '700', paddingVertical: 6 },
   list: { paddingHorizontal: 12, paddingVertical: 12, flexGrow: 1 },
   empty: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 8, padding: 32 },
   emptyName: { color: colors.text, fontSize: 18, fontWeight: '600', marginTop: 4 },
