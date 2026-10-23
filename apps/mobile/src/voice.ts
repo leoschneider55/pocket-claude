@@ -393,6 +393,8 @@ const SILENCE_MS = 1100;
 const THINKING_CUE_AFTER_MS = 4000;
 /** Those cues come at most this often. */
 const THINKING_CUE_EVERY_MS = 8000;
+const OBSERVATION_PAUSE_MS = 500;
+const OBSERVATION_SIGNAL_MS = 200;
 /** About 40 seconds of speech: a longer spoken answer is cut short with "the rest is in the chat". */
 const MAX_SPOKEN_PER_TURN = 550;
 const LOG_LINES = 150;
@@ -415,6 +417,8 @@ export class VoiceCall {
   private mode: CaptureMode = 'off';
   private thinkingSound = false;
   private thinkingTimer: ReturnType<typeof setTimeout> | null = null;
+  private observationTimer: ReturnType<typeof setTimeout> | null = null;
+  private observationSignal: { key: string; text: string } | null = null;
   /** A notice about something that passes (recognition trouble, the background): cleared once the user is heard. */
   private passingNotice: string | null = null;
   private lastCueAt = Number.NEGATIVE_INFINITY;
@@ -432,6 +436,8 @@ export class VoiceCall {
   private sessionState: SessionState | undefined;
   /** Assistant item key → characters of its speakable text already queued. */
   private readonly spoken = new Map<string, number>();
+  private readonly observedResults = new Set<string>();
+  private readonly queuedObservations: { key: string; text: string }[] = [];
   /** Utterances sent during this call: the last that many user messages of the thread are ours. */
   private sentCount = 0;
   private awaitingReply = false;
@@ -455,6 +461,7 @@ export class VoiceCall {
   constructor(private readonly deps: VoiceCallDeps) {
     this.lang = callLang(deps.language);
     this.items = deps.initialThread;
+    for (const item of this.items) if (item.type === 'result' && item.observation) this.observedResults.add(item.key);
     this.snap = {
       phase: 'starting',
       heard: '',
@@ -513,6 +520,7 @@ export class VoiceCall {
     if (this.ended) return;
     this.ended = true;
     this.clearThinking();
+    this.clearObservationAnnouncements();
     this.deps.engine.end();
     this.unsubscribe?.();
     this.unsubscribe = null;
@@ -546,7 +554,10 @@ export class VoiceCall {
       if (this.rebuilt(items)) {
         // History was reloaded with fresh keys: what it holds counts as already read.
         this.note(`thread reloaded (${items.length} items)`);
-        for (const item of items) if (item.type === 'assistant') this.spoken.set(item.key, Number.MAX_SAFE_INTEGER);
+        for (const item of items) {
+          if (item.type === 'assistant') this.spoken.set(item.key, Number.MAX_SAFE_INTEGER);
+          if (item.type === 'result' && item.observation) this.observedResults.add(item.key);
+        }
         this.skipFrom = -1;
       }
       this.items = items;
@@ -556,7 +567,9 @@ export class VoiceCall {
       this.awaitingReply = false;
       this.note('turn finished');
     }
+    this.queueObservationReplies(items);
     this.sync();
+    this.drainObservationQueue();
   }
 
   /** Pending permission prompts of this session. */
@@ -574,6 +587,7 @@ export class VoiceCall {
       this.say(permissionQuestion(next.tool, next.input, this.lang), true);
     }
     this.sync();
+    this.drainObservationQueue();
   }
 
   // -------------------------------------------------------------------------------------------------------------
@@ -767,6 +781,10 @@ export class VoiceCall {
   }
 
   private readItem(item: Extract<ChatItem, { type: 'assistant' }>): void {
+    if (item.observation) {
+      this.spoken.set(item.key, Number.MAX_SAFE_INTEGER);
+      return;
+    }
     const part = oralPart(item.text);
     const clean = speakable(part.oral);
     const done = this.spoken.get(item.key) ?? 0;
@@ -787,6 +805,79 @@ export class VoiceCall {
     const phrase = this.spokenThisTurn > 0 ? phrases.rest : part.code !== null ? phrases.code(CODE_NAMES[part.code.toLowerCase()] ?? null) : phrases.inChat;
     this.turnCapped = true;
     this.say(phrase, true);
+  }
+
+  private queueObservationReplies(items: readonly ChatItem[]): void {
+    for (let i = 0; i < items.length; i++) {
+      const result = items[i]!;
+      if (result.type !== 'result' || !result.observation || this.observedResults.has(result.key)) continue;
+      this.observedResults.add(result.key);
+
+      let answer = '';
+      for (let j = i - 1; j >= 0; j--) {
+        const item = items[j]!;
+        if (item.type === 'user') break;
+        if (item.type === 'assistant' && item.observation) {
+          answer = item.text;
+          break;
+        }
+      }
+      const raw = answer.trim();
+      if (!raw || raw.toLowerCase() === '[quiet]') continue;
+      const text = speakable(oralPart(raw).oral);
+      if (text) this.queuedObservations.push({ key: result.key, text });
+    }
+  }
+
+  private observationCanSpeak(): boolean {
+    return !this.ended && !this.failed && !this.held && !this.snap.userSpeaking && !this.speakingNow() && !this.awaitingReply && this.sessionState !== 'running' && this.sessionState !== 'waiting_permission';
+  }
+
+  private drainObservationQueue(): void {
+    if (!this.observationCanSpeak()) {
+      this.cancelObservationAnnouncement();
+      return;
+    }
+    if (!this.queuedObservations.length || this.observationTimer) return;
+    this.observationTimer = setTimeout(() => {
+      this.observationTimer = null;
+      if (!this.observationCanSpeak()) return;
+      const next = this.queuedObservations.shift();
+      if (!next) return;
+      this.observationSignal = next;
+      this.deps.engine.setThinking(true);
+      this.observationTimer = setTimeout(() => {
+        this.observationTimer = null;
+        this.deps.engine.setThinking(false);
+        this.observationSignal = null;
+        if (!this.observationCanSpeak()) {
+          this.queuedObservations.unshift(next);
+          return;
+        }
+        this.note(`screen observation ${next.key}`);
+        this.say(next.text, true);
+        this.sync();
+        this.drainObservationQueue();
+      }, OBSERVATION_SIGNAL_MS);
+    }, OBSERVATION_PAUSE_MS);
+  }
+
+  private cancelObservationAnnouncement(): void {
+    if (this.observationTimer) clearTimeout(this.observationTimer);
+    this.observationTimer = null;
+    if (this.observationSignal) {
+      this.deps.engine.setThinking(false);
+      this.queuedObservations.unshift(this.observationSignal);
+      this.observationSignal = null;
+    }
+  }
+
+  private clearObservationAnnouncements(): void {
+    if (this.observationTimer) clearTimeout(this.observationTimer);
+    this.observationTimer = null;
+    if (this.observationSignal) this.deps.engine.setThinking(false);
+    this.observationSignal = null;
+    this.queuedObservations.length = 0;
   }
 
   private say(text: string, always: boolean, filler = false): void {
