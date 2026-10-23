@@ -4,6 +4,7 @@ import { DeviceLink, type IncomingMessage, type WebSocketCtor } from '@pocket/tr
 import type { ClipboardBackend } from './clipboard.js';
 import type { ComputerBackend } from './computer.js';
 import type { ScreenBackend } from './screenshot.js';
+import { ScreenWatchController, type ScreenWatchHost } from './watch.js';
 
 export interface AgentState {
   relayUrl: string;
@@ -31,6 +32,7 @@ export interface OverlaySink {
 /** Shares this computer's clipboard and screen with the paired Mac and, when allowed, its mouse and keyboard; no files, no commands. */
 export class ClipboardAgent {
   private readonly link: DeviceLink;
+  private readonly watch: ScreenWatchController | undefined;
   private overlay: OverlaySink | undefined;
 
   constructor(
@@ -41,6 +43,8 @@ export class ClipboardAgent {
       screen?: ScreenBackend;
       /** Computer use: screen, mouse, keyboard and windows; absent means the computer does not offer it. */
       computer?: ComputerBackend;
+      /** Read-only screen watch backed by the persistent Windows computer host. */
+      watch?: ScreenWatchHost;
       WebSocket?: WebSocketCtor;
       log: (m: string) => void;
       /** The relay moved; the caller persists the new address. */
