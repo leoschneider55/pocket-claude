@@ -152,7 +152,8 @@ namespace PocketOverlay
         TextBox composer;
         TextBlock composerHint, sendError, sendIcon;
         Border composerBox, sendBox;
-        Button sendButton;
+        Button sendButton, watchButton;
+        TextBlock watchIcon;
         // What is typed survives a theme switch, which rebuilds the window.
         string draft = "";
         bool sending;
@@ -161,7 +162,7 @@ namespace PocketOverlay
         string chatId = "", titleText = "Pocket", statusText = "", statusTone = "idle";
         string selectedId;
         int renderFrom;
-        bool loading, autoScroll = true, tall, drawerOpen;
+        bool loading, autoScroll = true, tall, drawerOpen, watching;
         bool altDown, altCombo;
         int altSince, lastTap;
 
@@ -268,6 +269,7 @@ namespace PocketOverlay
             g.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             g.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             g.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             var chatsButton = IconButton("\uE700", "Чаты", "chats", ToggleDrawer, 15);
             chatsButton.Margin = new Thickness(6, 0, 2, 0);
             Put(g, chatsButton, 0, 0);
@@ -285,13 +287,16 @@ namespace PocketOverlay
             titles.Children.Add(statusLine);
             Put(g, titles, 1, 0);
 
-            Put(g, IconButton("\uE706", "Светлая или тёмная тема", "theme", ToggleTheme, 14), 2, 0);
+            watchButton = IconButton("\uE890", "Смотреть экран", "watch", ToggleWatch, 14);
+            watchIcon = (TextBlock)((Border)watchButton.Content).Child;
+            Put(g, watchButton, 2, 0);
+            Put(g, IconButton("\uE706", "Светлая или тёмная тема", "theme", ToggleTheme, 14), 3, 0);
             var tallButton = IconButton(tall ? "\uE73F" : "\uE740", "Высокое окно", "tall", ToggleTall, 13);
             tallIcon = (TextBlock)((Border)tallButton.Content).Child;
-            Put(g, tallButton, 3, 0);
+            Put(g, tallButton, 4, 0);
             var hide = IconButton("\uE8BB", "Скрыть (Alt или Esc)", "hide", HideOverlay, 11);
             hide.Margin = new Thickness(0, 0, 6, 0);
-            Put(g, hide, 4, 0);
+            Put(g, hide, 5, 0);
             // The header is the handle for moving the window; buttons on it handle their own clicks.
             g.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e)
             {
@@ -585,6 +590,12 @@ namespace PocketOverlay
             statusBlock.Foreground = statusTone == "idle" || statusTone.Length == 0 ? P.Muted : ToneBrush(statusTone);
             statusDot.Fill = ToneBrush(statusTone);
             statusLine.Visibility = statusText.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+            if (watchButton != null)
+            {
+                watchButton.ToolTip = watching ? "Перестать смотреть экран" : "Смотреть экран";
+                watchButton.IsEnabled = chatId.Length > 0 && statusTone != "offline";
+                watchIcon.Foreground = watching ? P.Accent : P.Muted;
+            }
             UpdateComposer();
         }
 
@@ -712,6 +723,7 @@ namespace PocketOverlay
             if (s == null) return;
             statusText = S(s, "text");
             statusTone = S(s, "tone");
+            watching = B(s, "watching");
             ApplyStatus();
         }
 
@@ -1319,6 +1331,12 @@ namespace PocketOverlay
             string next = themeName == "dark" ? "light" : "dark";
             SetTheme(next);
             Emit("theme", "theme", next);
+        }
+
+        void ToggleWatch()
+        {
+            if (chatId.Length == 0 || statusTone == "offline") return;
+            Emit("watch");
         }
 
         void ToggleTall()
