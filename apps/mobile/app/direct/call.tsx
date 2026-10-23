@@ -8,7 +8,7 @@ import { useCallPrefs } from '../../src/call-prefs';
 import { ClaudeAvatar } from '../../src/components/ClaudeAvatar';
 import { useAppActive } from '../../src/hooks';
 import { personaFor } from '../../src/persona';
-import { useChatSelector } from '../../src/session';
+import { useChatSelector, useSession } from '../../src/session';
 import { colors } from '../../src/theme';
 
 /**
@@ -22,9 +22,13 @@ export default function CallScreen() {
   const sessionId = id ?? '';
   const call = useCall();
   const prefs = useCallPrefs();
+  const { client } = useSession();
   const persona = useMemo(() => personaFor(sessionId), [sessionId]);
   const brainOnline = useChatSelector((s) => s.brainOnline);
   const connection = useChatSelector((s) => s.connection);
+  const session = useChatSelector((s) => s.sessions.find((x) => x.sessionId === sessionId));
+  const computers = useChatSelector((s) => s.computers);
+  const activeComputer = useChatSelector((s) => s.activeComputer);
   const appActive = useAppActive();
   const [speaker, setSpeaker] = useState(prefs.speaker);
   const { start } = call;
@@ -51,6 +55,11 @@ export default function CallScreen() {
   const phase = snap?.phase ?? 'starting';
   const speaking = phase === 'speaking';
   const muted = phase === 'muted';
+  const watching = session?.watch?.state === 'watching' || session?.watch?.state === 'paused';
+  const canWatch = client?.canWatchScreen(sessionId) ?? false;
+  const watchLabel = session?.watch?.state === 'watching' ? '👁 Claude смотрит экран' : session?.watch?.state === 'paused' ? '👁 Наблюдение приостановлено' : null;
+  const selectedComputerId = session?.executorId ?? activeComputer;
+  const selectedComputer = computers.find((computer) => computer.deviceId === selectedComputerId);
 
   const hangUp = () => {
     call.hangUp();
@@ -61,6 +70,10 @@ export default function CallScreen() {
     const next = !speaker;
     setSpeaker(next);
     call.setSpeaker(next);
+  };
+
+  const toggleWatch = () => {
+    client?.setScreenWatch(sessionId, !watching, !watching && session?.watch?.settings ? { settings: session.watch.settings } : {});
   };
 
   const shareLog = () => {
@@ -84,6 +97,19 @@ export default function CallScreen() {
         <Pressable onLongPress={shareLog} delayLongPress={600} hitSlop={8} accessibilityHint="Long press to send the call log">
           <Text style={[styles.status, phase === 'error' && { color: colors.danger }, phase === 'listening' && { color: colors.ok }]}>{status}</Text>
         </Pressable>
+        {watchLabel ? <Text style={styles.watchIndicator}>{watchLabel}</Text> : null}
+        {watching || canWatch ? (
+          <Pressable
+            onPress={toggleWatch}
+            disabled={!watching && !canWatch}
+            style={[styles.watchControl, watching && styles.watchControlOn]}
+            accessibilityRole="button"
+            accessibilityLabel={watching ? 'Перестать смотреть экран' : 'Смотреть экран'}
+          >
+            <Ionicons name={watching ? 'eye' : 'eye-outline'} size={18} color={watching ? colors.accent : colors.text} />
+            <Text style={styles.watchControlText}>{watching ? 'Перестать смотреть экран' : `Смотреть экран${selectedComputer ? ` · ${selectedComputer.name}` : ''}`}</Text>
+          </Pressable>
+        ) : null}
         {phase === 'error' && snap?.errorAction === 'settings' ? (
           <Pressable onPress={() => void Linking.openSettings()} style={styles.action} accessibilityRole="button">
             <Text style={styles.actionText}>Open Settings</Text>
@@ -130,6 +156,10 @@ const styles = StyleSheet.create({
   name: { color: colors.text, fontSize: 26, fontWeight: '700', marginTop: 12 },
   timer: { color: colors.textMuted, fontSize: 15, fontVariant: ['tabular-nums'] },
   status: { color: colors.textMuted, fontSize: 15, marginTop: 4, textAlign: 'center' },
+  watchIndicator: { color: colors.accent, fontSize: 13, textAlign: 'center', marginTop: 2 },
+  watchControl: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 14, paddingVertical: 9, borderRadius: 20, backgroundColor: colors.surface, marginTop: 4 },
+  watchControlOn: { borderWidth: StyleSheet.hairlineWidth, borderColor: colors.accent },
+  watchControlText: { color: colors.text, fontSize: 13, fontWeight: '600' },
   badges: { color: colors.textMuted, fontSize: 12, textAlign: 'center' },
   action: { marginTop: 4, paddingHorizontal: 18, paddingVertical: 10, borderRadius: 20, backgroundColor: colors.surface },
   actionText: { color: colors.accent, fontSize: 15, fontWeight: '600' },
