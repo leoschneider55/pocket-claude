@@ -1,6 +1,15 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { tool, type SdkMcpToolDefinition } from '@anthropic-ai/claude-agent-sdk';
-import { MCP_SERVER_NAME, type ClipboardItem, type ComputerAction, type ComputerResult, type ScreenImage } from '@pocket/protocol';
+import {
+  MCP_SERVER_NAME,
+  screenWatchSettingsPatchSchema,
+  type ClipboardItem,
+  type ComputerAction,
+  type ComputerResult,
+  type ScreenImage,
+  type ScreenWatchSettings,
+  type ScreenWatchStatus,
+} from '@pocket/protocol';
 import { z } from 'zod';
 
 /** The user's own Windows computer with PocketClipboard on it, as a chat sees it; resolved on every use. */
@@ -12,11 +21,13 @@ export interface PcHandle {
   clipboardRead(): Promise<{ items?: ClipboardItem[]; error?: string }>;
   clipboardWrite(item: ClipboardItem): Promise<{ error?: string }>;
   screenshot(): Promise<{ image?: ScreenImage; error?: string }>;
+  /** Controls the watcher for this chat; the handle resolves the user's selected PC. */
+  screenWatch?(enabled: boolean, goal?: string, settings?: Partial<ScreenWatchSettings>): Promise<{ status?: ScreenWatchStatus; error?: string }>;
   /** One computer-use step, in physical desktop pixels (the 'computer' capability). */
   computer(action: ComputerAction): Promise<ComputerResult & { error?: string }>;
 }
 
-export const PC_TOOL_NAMES = ['pc_clipboard_read', 'pc_clipboard_write', 'pc_screenshot'] as const;
+export const PC_TOOL_NAMES = ['pc_clipboard_read', 'pc_clipboard_write', 'pc_screenshot', 'screen_watch'] as const;
 export const PC_ALLOWED_TOOLS = PC_TOOL_NAMES.map((n) => `mcp__${MCP_SERVER_NAME}__${n}`);
 
 const isImageMime = (mime: string): mime is 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp' => /^image\/(png|jpeg|gif|webp)$/.test(mime);
@@ -33,6 +44,7 @@ export function pcToolsPrompt(pcName: string | undefined): string {
     '# The user\'s own computer',
     `The user has PocketClipboard on ${who}. mcp__pocket__pc_clipboard_read shows what they copied there, mcp__pocket__pc_clipboard_write puts text there for them to paste with Ctrl+V, mcp__pocket__pc_screenshot shows you their screens.`,
     'When they ask you to put a command or text "in the clipboard" / "in the buffer", call pc_clipboard_write with exactly the text to paste (no markdown fences) and confirm in one short sentence. When they ask what is on their screen or to look at something, take a screenshot and describe what matters.',
+    'Only when the user asks you to watch the screen, use screen_watch with action on; use action off when they ask you to stop. It controls only the computer selected for this chat.',
   ].join('\n');
 }
 
@@ -95,6 +107,24 @@ export function pcTools(pc: () => PcHandle): SdkMcpToolDefinition<any>[] {
             { type: 'text', text: `Screenshot of "${p.name}", ${r.image.width}x${r.image.height}, all monitors side by side.` },
           ],
         };
+      },
+    ),
+    tool(
+      'screen_watch',
+      "Start or stop watching the screen of the user's selected computer. Use only when the user explicitly asks to watch or stop watching; an optional goal tells Claude what event to wait for.",
+      {
+        action: z.enum(['on', 'off']).describe('Whether to start or stop screen watching'),
+        goal: z.string().max(1000).optional().describe('Optional event to watch for, such as a build finishing'),
+        settings: screenWatchSettingsPatchSchema.optional().describe('Optional lower observation limits or sampling settings'),
+      },
+      async ({ action, goal, settings }) => {
+        const control = pc().screenWatch;
+        if (!control) return fail('Screen watching is unavailable in this chat.');
+        const result = await control(action === 'on', goal, settings);
+        if (result.error) return fail(result.error);
+        if (result.status?.state === 'paused') return ok('Пауза наблюдения: много изменений.');
+        if (result.status?.state === 'watching') return ok(`👁 Claude смотрит экран${result.status.goal ? `: ${result.status.goal}` : ''}.`);
+        return ok('Наблюдение экрана выключено.');
       },
     ),
   ];
