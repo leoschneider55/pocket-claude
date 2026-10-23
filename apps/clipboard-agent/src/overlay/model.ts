@@ -1,5 +1,5 @@
 import { applyEvent, buildThread, parseRichMarkdown, type ChatItem, type RichBlock } from '@pocket/client-core';
-import type { InnerMessageBody, SessionMeta, SessionState } from '@pocket/protocol';
+import { DEFAULT_SCREEN_WATCH_SETTINGS, type InnerMessageBody, type ScreenWatchStatus, type SessionMeta, type SessionState } from '@pocket/protocol';
 import { actionTitle, attachmentsAction, groupOf, runState, toolAction, type ActionState, type OverlayAction, type ToolItem } from './actions.js';
 
 export type OverlayTheme = 'dark' | 'light';
@@ -34,6 +34,7 @@ export type OverlayMessage =
 export interface OverlayStatus {
   text: string;
   tone: OverlayTone;
+  watching?: boolean;
 }
 
 /** One chat in the window's side list. */
@@ -94,6 +95,7 @@ const OFFLINE = 'Mac не в сети, сообщение не отправле�
  */
 export class OverlayModel {
   private readonly sessions = new Map<string, SessionMeta>();
+  private readonly watchBySession = new Map<string, ScreenWatchStatus>();
   private readonly threads = new Map<string, ChatItem[]>();
   private readonly loaded = new Set<string>();
   private readonly requested = new Set<string>();
@@ -145,6 +147,16 @@ export class OverlayModel {
     this.deps.request({ type: 'message.send', payload: { sessionId: chatId, text: body } });
   }
 
+  toggleWatch(): void {
+    if (!this.activeId) return;
+    const status = this.watchBySession.get(this.activeId) ?? this.sessions.get(this.activeId)?.watch;
+    const enabled = status?.state !== 'watching' && status?.state !== 'paused';
+    this.deps.request({
+      type: 'screen.watch.set',
+      payload: { sessionId: this.activeId, enabled, ...(enabled ? { settings: DEFAULT_SCREEN_WATCH_SETTINGS } : {}) },
+    });
+  }
+
   /** The user picked a chat in the window's list. */
   open(sessionId: string): void {
     if (sessionId === this.activeId || !this.sessions.has(sessionId)) return;
@@ -176,7 +188,11 @@ export class OverlayModel {
     switch (message.type) {
       case 'session.list.result':
         this.sessions.clear();
-        for (const s of message.payload.sessions) if (!s.hidden) this.sessions.set(s.sessionId, s);
+        this.watchBySession.clear();
+        for (const s of message.payload.sessions) {
+          if (s.watch) this.watchBySession.set(s.sessionId, s.watch);
+          if (!s.hidden) this.sessions.set(s.sessionId, s);
+        }
         // After a reconnect the chat being read stays on screen.
         if (this.activeId && this.sessions.has(this.activeId)) this.activate(this.activeId);
         else this.pickActive();
@@ -185,6 +201,7 @@ export class OverlayModel {
         const s = message.payload.session;
         if (s.hidden) return;
         this.sessions.set(s.sessionId, s);
+        if (s.watch) this.watchBySession.set(s.sessionId, s.watch);
         // The phone just opened it: that is where the next messages go.
         this.activate(s.sessionId);
         return;
@@ -199,6 +216,7 @@ export class OverlayModel {
         }
         const before = this.sessions.get(s.sessionId);
         this.sessions.set(s.sessionId, s);
+        if (s.watch) this.watchBySession.set(s.sessionId, s.watch);
         if (s.sessionId === this.activeId) {
           if (before?.title !== s.title) this.deps.window({ op: 'title', title: s.title });
           if (before?.state !== s.state) this.stateChanged(s.sessionId);
