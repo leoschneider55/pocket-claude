@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { Options, Query, SDKMessage } from '@anthropic-ai/claude-agent-sdk';
-import type { SessionMeta } from '@pocket/protocol';
+import type { Options, Query, SDKMessage, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
+import type { SessionEvent, SessionMeta } from '@pocket/protocol';
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const dirs = vi.hoisted(() => {
@@ -55,6 +55,7 @@ const settle = () => new Promise((r) => setTimeout(r, 10));
 
 let fake: FakeQuery;
 const metas: SessionMeta[] = [];
+let promptInput: AsyncIterable<SDKUserMessage> | undefined;
 
 function host(over: Partial<Host> = {}): Host {
   return {
@@ -71,18 +72,27 @@ function host(over: Partial<Host> = {}): Host {
   };
 }
 
-function newSession(id = 'aaaaaaaa-1111-2222-3333-444444444444', over: Partial<SessionMeta> = {}) {
+function newSession(id = 'aaaaaaaa-1111-2222-3333-444444444444', over: Partial<SessionMeta> = {}, hostOver: Partial<Host> = {}) {
   const now = Date.UTC(2026, 9, 23, 12);
-  return new Session({ sessionId: id, title: 'Test', state: 'idle', createdAt: now, updatedAt: now, userId: 'owner', ...over }, host(), false);
+  return new Session({ sessionId: id, title: 'Test', state: 'idle', createdAt: now, updatedAt: now, userId: 'owner', ...over }, host(hostOver), false);
 }
 
 const appended = () => (fake.options.systemPrompt as { append?: string }).append ?? '';
 
+async function nextInputMessage(): Promise<SDKUserMessage> {
+  if (!promptInput) throw new Error('session prompt input was not captured');
+  const next = await promptInput[Symbol.asyncIterator]().next();
+  if (next.done) throw new Error('session prompt input ended');
+  return next.value;
+}
+
 beforeEach(() => {
   metas.length = 0;
+  promptInput = undefined;
   mkdirSync(join(dirs.home, 'sessions'), { recursive: true });
-  vi.mocked(query).mockImplementation(({ options }) => {
+  vi.mocked(query).mockImplementation(({ options, prompt }) => {
     fake = new FakeQuery(options ?? {});
+    promptInput = prompt as AsyncIterable<SDKUserMessage>;
     return fake as unknown as Query;
   });
 });
@@ -127,6 +137,49 @@ describe('Claude switching its own model', () => {
     expect(fake).not.toBe(first);
     expect(fake.options.model).toBe('fable');
     expect(first.setModel).not.toHaveBeenCalled();
+    s.stop();
+  });
+});
+
+describe('screen observation input', () => {
+  it('attaches observation frames with channel provenance and keeps them out of lastText', async () => {
+    const events: SessionEvent[] = [];
+    const s = newSession('aaaaaaaa-1111-2222-3333-444444444445', {}, { emit: (_id, event) => events.push(event) });
+    const turn = {
+      from: 'screen-watch',
+      text: 'Review this screen frame.',
+      screenFrame: { image: 'ZmFrZS1qcGVn', windowTitle: 'Editor', capturedAt: 123, frameId: 'frame-1', retainFrames: 2 },
+      observation: { windowTitle: 'Editor', capturedAt: 123, goal: 'Wait for the error dialog.' },
+    };
+
+    await s.send(turn);
+
+    const input = await nextInputMessage();
+    expect(input.origin).toEqual({ kind: 'channel', server: 'pocket-screen-watch' });
+    expect(input.message.content).toEqual([
+      { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: turn.screenFrame.image } },
+      { type: 'text', text: turn.text },
+    ]);
+    expect(events).toContainEqual(expect.objectContaining({ kind: 'user', from: 'screen-watch', observation: true, images: 1 }));
+    expect(s.meta.lastText).toBeUndefined();
+    s.stop();
+  });
+
+  it('keeps a frame attached to a user turn human-originated', async () => {
+    const s = newSession('aaaaaaaa-1111-2222-3333-444444444446');
+
+    await s.send({
+      from: 'phone',
+      text: 'What is on screen?',
+      screenFrame: { image: 'ZmFrZS1qcGVn', windowTitle: 'Editor', capturedAt: 123, frameId: 'frame-2', retainFrames: 2 },
+    });
+
+    const input = await nextInputMessage();
+    expect(input.origin).toEqual({ kind: 'human' });
+    expect(input.message.content).toEqual([
+      { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: 'ZmFrZS1qcGVn' } },
+      { type: 'text', text: 'What is on screen?' },
+    ]);
     s.stop();
   });
 });

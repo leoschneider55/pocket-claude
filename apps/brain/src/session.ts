@@ -54,6 +54,8 @@ export interface UserTurn {
   from: string;
   /** Spoken on a call: the reply is read aloud, so it must be short and plain. */
   voice?: boolean;
+  screenFrame?: { image: string; windowTitle: string; capturedAt: number; frameId: string; retainFrames: number };
+  observation?: { windowTitle: string; capturedAt: number; goal?: string };
 }
 
 /** Prepended to spoken turns. Claude keeps its tools; only the shape of the answer changes. */
@@ -336,18 +338,20 @@ export class Session {
     const attachments = turn.attachments ?? [];
     const images = attachments.filter((a) => isImage(a.mime) && !a.name);
     const files = attachments.filter((a) => !images.includes(a));
+    const imageCount = images.length + (turn.screenFrame ? 1 : 0);
     this.record(
       {
         kind: 'user',
         text: turn.text,
         from: turn.from,
-        ...(images.length ? { images: images.length } : {}),
+        ...(imageCount ? { images: imageCount } : {}),
         ...(files.length ? { files: files.map((f, i) => safeFileName(f.name, `file-${i + 1}`)) } : {}),
         ...(turn.voice ? { voice: true } : {}),
+        ...(turn.observation ? { observation: true } : {}),
       },
       true,
     );
-    this.setMeta({ lastText: turn.text.slice(0, 200) });
+    if (!turn.observation) this.setMeta({ lastText: turn.text.slice(0, 200) });
     if (!this.q) await this.start();
     this.setState('running');
     this.turnStartedAt ??= Date.now();
@@ -355,11 +359,18 @@ export class Session {
       type: 'image' as const,
       source: { type: 'base64' as const, media_type: img.mime as 'image/png', data: img.dataBase64 },
     }));
+    if (turn.screenFrame) {
+      blocks.unshift({
+        type: 'image',
+        source: { type: 'base64', media_type: 'image/jpeg', data: turn.screenFrame.image },
+      });
+    }
     const notes = this.saveFiles(files, blocks);
     const spoken = turn.voice ? `${VOICE_NOTE}\n\n${turn.text}` : turn.text;
     const text = notes.length ? `${spoken}\n\n${notes.join('\n')}` : spoken;
     const content: SDKUserMessage['message']['content'] = blocks.length ? [...blocks, { type: 'text' as const, text }] : text;
-    this.input!.push({ type: 'user', message: { role: 'user', content }, parent_tool_use_id: null, origin: { kind: 'human' } } as SDKUserMessage);
+    const origin = turn.observation ? { kind: 'channel' as const, server: 'pocket-screen-watch' } : { kind: 'human' as const };
+    this.input!.push({ type: 'user', message: { role: 'user', content }, parent_tool_use_id: null, origin } as SDKUserMessage);
     this.touch();
   }
 
