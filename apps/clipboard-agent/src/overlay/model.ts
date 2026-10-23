@@ -1,5 +1,5 @@
 import { applyEvent, buildThread, parseRichMarkdown, type ChatItem, type RichBlock } from '@pocket/client-core';
-import type { InnerMessageBody, SessionMeta, SessionState } from '@pocket/protocol';
+import { DEFAULT_SCREEN_WATCH_SETTINGS, type InnerMessageBody, type ScreenWatchStatus, type SessionMeta, type SessionState } from '@pocket/protocol';
 import { actionTitle, attachmentsAction, groupOf, runState, toolAction, type ActionState, type OverlayAction, type ToolItem } from './actions.js';
 
 export type OverlayTheme = 'dark' | 'light';
@@ -34,6 +34,7 @@ export type OverlayMessage =
 export interface OverlayStatus {
   text: string;
   tone: OverlayTone;
+  watching?: boolean;
 }
 
 /** One chat in the window's side list. */
@@ -94,6 +95,7 @@ const OFFLINE = 'Mac не в сети, сообщение не отправле�
  */
 export class OverlayModel {
   private readonly sessions = new Map<string, SessionMeta>();
+  private readonly watchBySession = new Map<string, ScreenWatchStatus>();
   private readonly threads = new Map<string, ChatItem[]>();
   private readonly loaded = new Set<string>();
   private readonly requested = new Set<string>();
