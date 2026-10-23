@@ -51,4 +51,36 @@ describe('thread reducer', () => {
     ]);
     expect(items[0]).toMatchObject({ streaming: false });
   });
+
+  it('keeps screen-watch announcements and hides quiet observation replies', () => {
+    const items = buildThread([
+      { kind: 'screen_watch', at: 123, text: 'Изменение на экране: Telegram' },
+      { kind: 'user', text: 'Наблюдение', from: 'screen', images: 1, observation: true },
+      { kind: 'text_delta', text: '[quiet]' },
+      { kind: 'text', text: '[quiet]', observation: true },
+      { kind: 'result', observation: true },
+    ]);
+
+    expect(items).toMatchObject([
+      { type: 'screen_watch', at: 123, text: 'Изменение на экране: Telegram' },
+      { type: 'user', observation: true, images: 1 },
+      { type: 'result', observation: true },
+    ]);
+    expect(items.some((item) => item.type === 'assistant')).toBe(false);
+  });
+
+  it('marks streamed assistant text as an observation turn', () => {
+    const items = buildThread([
+      { kind: 'user', text: 'Наблюдение', from: 'screen', observation: true },
+      { kind: 'text_delta', text: 'Сборка закончилась.' },
+      { kind: 'text', text: 'Сборка закончилась.', observation: true },
+      { kind: 'result', observation: true },
+    ]);
+
+    expect(items).toMatchObject([
+      { type: 'user', observation: true },
+      { type: 'assistant', observation: true, text: 'Сборка закончилась.', streaming: false },
+      { type: 'result', observation: true },
+    ]);
+  });
 });
