@@ -56,6 +56,18 @@ With PocketClipboard on a Windows computer, Claude can operate it like a person 
 
 It is off on every computer until its owner runs `PocketClipboard.exe computer on` there (`computer off` turns it off again), so nobody else's PC can be driven without them. The first action in a chat asks once on the phone, in Telegram or aloud on a call, and covers the whole chat; `pocket-claude allow add computer` allows it for good. ⏹ or the kill switch stops a step midway and lets go of held keys. Windows does not let a normal program type into windows running as administrator, UAC prompts or the lock screen. Rebuild and reinstall `PocketClipboard.exe` (`apps/clipboard-agent/scripts/build-exe.sh`) to get it.
 
+## Screen watch — «Claude смотрит»
+
+Use **👁 Смотреть экран** in a chat, on the call screen, or in the Windows overlay. Voice requests such as “смотри за экраном”, “хватит смотреть” and “скажи, когда закончится сборка” use `screen_watch`. Watching belongs to one chat and its selected Windows PC, never another person's computer.
+
+PocketClipboard compares small frames locally in its persistent PowerShell host. Only a settled, significant change sends a JPEG up to 1280×800, with the foreground window/process and changed area, over the existing E2E channel to the Mac. Images are not written to the PC's disk. Empty or `[quiet]` observations are neither shown nor spoken.
+
+Defaults are a 1-second sample interval (configurable from 0.5 to 3 seconds), 1.5-second settling, and hard ceilings of 4 observation turns per minute and 60 per hour. Exceeding a limit pauses observation with a notice. Watching stops after 15 minutes without a user message, on lock/sleep, PC disconnection, or the kill switch; reconnecting does not restart it.
+
+User messages automatically receive a frame no older than 10 seconds, requesting a fresh one when needed. Only **watch** images age out of Claude's context (2 turns by default). Ordinary `pc_screenshot`, `computer` screenshots/zoom, and user attachments keep their existing quality and history. Claude can zoom or take a manual screenshot when a watch frame is too small to read. On calls, observations wait for a conversational pause and play a short signal before speaking.
+
+Update brain, mobile and PocketClipboard together. Real capture, lock/sleep, idle CPU and native call audio need the Windows/phone acceptance checks in [TZ-vision.md](TZ-vision.md); Linux/web tests cannot prove them.
+
 ## Telegram Mini App
 
 The same app inside Telegram, served by the Node relay on the Mac over its public HTTPS address (Tailscale Funnel):
