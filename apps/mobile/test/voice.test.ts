@@ -183,7 +183,9 @@ class FakeEngine implements SpeechEngine {
 let n = 0;
 const user = (text: string): ChatItem => ({ type: 'user', key: `u${++n}`, text, from: 'phone', voice: true });
 const reply = (key: string, text: string, streaming = false): ChatItem => ({ type: 'assistant', key, text, streaming });
-const result = (): ChatItem => ({ type: 'result', key: `r${++n}` });
+const observationUser = (): ChatItem => ({ type: 'user', key: `u${++n}`, text: 'Экран изменился', from: 'screen', observation: true });
+const observationReply = (key: string, text: string): ChatItem => ({ type: 'assistant', key, text, streaming: false, observation: true });
+const result = (observation = false): ChatItem => ({ type: 'result', key: `r${++n}`, ...(observation ? { observation: true } : {}) });
 const tool = (): ChatItem => ({ type: 'tool', key: `t${++n}`, id: `t${n}`, name: 'mcp__pocket__pc_screenshot', input: {}, output: '' });
 
 function setup(initialThread: ChatItem[] = [], info?: Partial<EngineInfo>) {
@@ -467,6 +469,60 @@ describe('VoiceCall', () => {
     vi.advanceTimersByTime(100);
     expect(engine.thinking).toEqual([true, false, true]);
     expect(engine.texts.filter((t) => t === 'Секунду.')).toHaveLength(1);
+  });
+
+  it('waits for a current Claude reply to finish and signals just before speaking an observation', async () => {
+    const { engine, call } = setup();
+    await call.start();
+    engine.emit({ type: 'final', text: 'что происходит' });
+    const asked = user('что происходит');
+    const current = [asked, reply('answer', 'Сейчас проверю экран.'), result()];
+    call.onThread(current, 'idle');
+    engine.begin();
+
+    const observed = [...current, observationUser(), observationReply('watch-answer', 'Сборка завершилась.'), result(true)];
+    call.onThread(observed, 'idle');
+    expect(engine.stopped).toBe(0);
+    expect(engine.texts).toEqual(['Сейчас проверю экран.']);
+
+    engine.finishSpeaking();
+    vi.advanceTimersByTime(500);
+    expect(engine.thinking).toEqual([true]);
+    expect(engine.texts).toEqual(['Сейчас проверю экран.']);
+    vi.advanceTimersByTime(350);
+    expect(engine.thinking).toEqual([true, false]);
+    expect(engine.texts).toEqual(['Сейчас проверю экран.', 'Сборка завершилась.']);
+    expect(engine.stopped).toBe(0);
+  });
+
+  it('waits until the user stops speaking and does not speak a quiet observation', async () => {
+    const { engine, call } = setup();
+    await call.start();
+    const obs = observationUser();
+    call.onThread([obs, observationReply('watch-answer', 'Ошибка в сборке.'), result(true)], 'idle');
+    engine.emit({ type: 'vad', speaking: true });
+    vi.advanceTimersByTime(1000);
+    expect(engine.texts).toEqual([]);
+    expect(engine.thinking).toEqual([]);
+
+    engine.emit({ type: 'vad', speaking: false });
+    vi.advanceTimersByTime(500);
+    expect(engine.thinking).toEqual([true]);
+    engine.emit({ type: 'vad', speaking: true });
+    vi.advanceTimersByTime(1000);
+    expect(engine.texts).toEqual([]);
+
+    engine.emit({ type: 'vad', speaking: false });
+    vi.advanceTimersByTime(850);
+    expect(engine.texts).toEqual(['Ошибка в сборке.']);
+    expect(engine.thinking).toEqual([true, false, true, false]);
+
+    const quiet = setup();
+    await quiet.call.start();
+    quiet.call.onThread([observationUser(), result(true)], 'idle');
+    vi.advanceTimersByTime(2000);
+    expect(quiet.engine.texts).toEqual([]);
+    expect(quiet.engine.thinking).toEqual([]);
   });
 
   it('logs how long the user waited for the first sound of the answer, "секунду" aside', async () => {
