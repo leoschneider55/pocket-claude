@@ -31,6 +31,9 @@ import {
   type PushHint,
   type RelayToDevice,
   type ScreenImage,
+  type ScreenWatchFrame,
+  type ScreenWatchSettings,
+  type ScreenWatchStatus,
   type SessionEvent,
   type SessionMeta,
 } from '@pocket/protocol';
@@ -45,6 +48,7 @@ import { log } from './log.js';
 import type { PcHandle } from './pc-tools.js';
 import { PermissionBroker, SANDBOX_NETWORK_TOOL } from './permissions.js';
 import { Session, type UserTurn } from './session.js';
+import { WatchManager, type WatchDevice, type WatchScreenFrame } from './watch-manager.js';
 import { migrateState, OWNER_ID, saveState, type BrainState, type PairedDevice, type UsageTotals, type User } from './store.js';
 
 const MAX_LIVE_SESSIONS = 2;
@@ -63,7 +67,12 @@ type PcRequest = Extract<InnerMessageBody, { type: 'clipboard.read' | 'clipboard
 type PcReply = Extract<InnerMessageBody, { type: 'clipboard.data' | 'clipboard.done' | 'screen.image' | 'computer.done' }>;
 type PcAnswer = ComputerResult & { items?: ClipboardItem[]; image?: ScreenImage; error?: string };
 /** The only client traffic a computer with the 'overlay' capability gets to see: the chat itself, nothing it could act on. */
-const OVERLAY_MIRRORED = new Set<MessageType>(['session.event', 'session.created', 'session.updated', 'session.deleted']);
+const OVERLAY_MIRRORED = new Set<MessageType>(['session.event', 'session.created', 'session.updated', 'session.deleted', 'screen.watch.status']);
+
+type WatchUserTurn = UserTurn & {
+  screenFrame?: WatchScreenFrame;
+  observation?: { windowTitle: string; capturedAt: number; goal?: string };
+};
 
 export interface PairingTicket {
   code: string;
@@ -106,6 +115,7 @@ export class Brain {
   private readonly link: DeviceLink;
   private readonly executor: ExecutorBridge;
   private readonly permissions: PermissionBroker;
+  private readonly watch: WatchManager;
   private readonly sessions = new Map<string, Session>();
   private readonly pairings = new Map<string, OpenPairing>();
   private readonly pendingDeltas = new Map<string, { text: string; timer: ReturnType<typeof setTimeout> }>();
@@ -145,8 +155,28 @@ export class Brain {
       resolved: (requestId, sessionId, decision, by) => this.toClients(this.userOfSession(sessionId), { type: 'permission.resolved', payload: { requestId, decision, by } }),
       waiting: (sessionId, waiting) => this.sessions.get(sessionId)?.setState(waiting ? 'waiting_permission' : 'running'),
     });
+    this.watch = new WatchManager({
+      session: (sessionId) => {
+        const s = this.sessions.get(sessionId);
+        return s ? { userId: this.userOfSession(sessionId), state: s.meta.state, busy: s.busy, watch: s.meta.watch } : undefined;
+      },
+      deviceForSession: (sessionId) => this.watchDeviceForSession(sessionId),
+      canObserve: (sessionId) => {
+        const s = this.sessions.get(sessionId);
+        return !!s && s.meta.state === 'idle' && !s.busy && !this.permissions.outstanding().some((p) => p.sessionId === sessionId);
+      },
+      sendControl: (deviceId, payload) => this.link.send(deviceId, { type: 'screen.watch.control', payload }),
+      sendCapture: (deviceId, payload) => this.link.send(deviceId, { type: 'screen.watch.capture', payload }),
+      publish: (status) => this.publishWatchStatus(status),
+      notice: (sessionId, text) => this.emitEvent(sessionId, { kind: 'screen_watch', at: Date.now(), text }, true),
+      observe: (frame, context) => this.sendWatchObservation(frame, context),
+    });
     for (const meta of state.sessions) {
-      const restored = { ...meta, state: meta.state === 'ended' ? 'ended' : 'idle' } as SessionMeta;
+      const restored = {
+        ...meta,
+        state: meta.state === 'ended' ? 'ended' : 'idle',
+        ...(meta.watch && meta.watch.state !== 'off' ? { watch: { ...meta.watch, state: 'off' as const, reason: 'offline' as const } } : {}),
+      } as SessionMeta;
       this.sessions.set(meta.sessionId, new Session(restored, this.sessionHost(), true));
     }
 
@@ -162,7 +192,10 @@ export class Brain {
       log(`${device.role} ${device.name} is ${online ? 'online' : 'offline'}`);
       if (online && this.state.publicRelayUrl) this.link.send(deviceId, { type: 'relay.moved', payload: { url: this.state.publicRelayUrl } });
       if (device.role === 'executor') {
-        if (!online) this.executor.failAll('The computer went offline.', deviceId);
+        if (!online) {
+          this.watch.deviceOffline(deviceId);
+          this.executor.failAll('The computer went offline.', deviceId);
+        } else this.disableRestoredWatcher(deviceId);
         this.broadcastStatus(online ? undefined : 'executor_offline');
         this.broadcastComputers();
       } else if (online) {
@@ -180,6 +213,7 @@ export class Brain {
   }
 
   stop(): void {
+    this.watch.shutdown();
     for (const s of this.sessions.values()) s.stop();
     this.persistNow();
     this.link.close();
@@ -215,6 +249,7 @@ export class Brain {
     for (const d of this.state.devices.filter((d) => d.userId === user.id)) this.removeDevice(d.deviceId);
     for (const s of [...this.sessions.values()].filter((s) => (s.meta.userId ?? OWNER_ID) === user.id)) {
       for (const p of this.permissions.outstanding()) if (p.sessionId === s.id) this.permissions.respond(p.requestId, 'deny', 'removed');
+      this.watch.removeSession(s.id);
       s.destroy();
       this.sessions.delete(s.id);
     }
@@ -306,6 +341,7 @@ export class Brain {
   removeDevice(deviceId: string): boolean {
     const device = this.state.devices.find((d) => d.deviceId === deviceId);
     if (!device) return false;
+    if (device.role === 'executor') this.watch.deviceRemoved(deviceId);
     this.state.devices = this.state.devices.filter((d) => d.deviceId !== deviceId);
     this.link.removePeer(deviceId);
     this.link.sendControl({ t: 'roster.remove', deviceId });
@@ -367,6 +403,23 @@ export class Brain {
     return hasClipboard(fallback) ? fallback : undefined;
   }
 
+  /** Watching uses the chat's selected computer, or the person's current default when the chat has none. */
+  private watchDeviceForSession(sessionId: string): WatchDevice | undefined {
+    const s = this.sessions.get(sessionId);
+    if (!s) return undefined;
+    const userId = this.userOfSession(sessionId);
+    const selected = s.meta.executorId;
+    const deviceId = selected ?? this.defaultExecutor(userId);
+    const device = this.executorDevices(userId).find((d) => d.deviceId === deviceId);
+    if (!device) return undefined;
+    return {
+      deviceId: device.deviceId,
+      userId: device.userId,
+      online: this.link.isOnline(device.deviceId),
+      capabilities: this.executor.info(device.deviceId)?.capabilities ?? [],
+    };
+  }
+
   /** Where a chat runs: the Mac, a tools computer, or chat-only on the Mac without files (people with just PocketClipboard). */
   sessionMode(sessionId: string): { mode: 'mac' | 'remote' | 'chat'; executorId?: string; pcId?: string } | undefined {
     if (!this.sessions.has(sessionId)) return undefined;
@@ -412,6 +465,7 @@ export class Brain {
       clipboardWrite: (item) => ask({ type: 'clipboard.write', payload: { requestId: randomUUID(), item } }),
       screenshot: () => ask({ type: 'screen.capture', payload: { requestId: randomUUID() } }),
       computer: (action) => ask({ type: 'computer.act', payload: { requestId: randomUUID(), action } }, computerTimeout(action)),
+      screenWatch: (enabled, goal, settings) => this.watch.set(sessionId, self.userOfSession(sessionId), { enabled, goal, settings }),
     };
   }
 
