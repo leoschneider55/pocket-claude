@@ -3,6 +3,11 @@ import { copyTargets, itemPieces, markdownPieces, packMessages, permissionHtml, 
 import { ReplyStream } from '../src/stream.js';
 
 describe('render', () => {
+  it('renders screen-watch notices as escaped service text', () => {
+    const pieces = itemPieces({ type: 'screen_watch', key: 'watch', at: 1, text: '👁 изменение на экране: <Build>' });
+    expect(packMessages(pieces)).toEqual(['<i>👁 изменение на экране: &lt;Build&gt;</i>']);
+  });
+
   it('turns markdown into escaped Telegram HTML', () => {
     const pieces = markdownPieces('Use `a<b` here\n\n```py\nprint("<hi>")\n```');
     expect(packMessages(pieces)).toEqual(['Use <code>a&lt;b</code> here\n\n<pre><code class="language-py">print("&lt;hi&gt;")</code></pre>']);
