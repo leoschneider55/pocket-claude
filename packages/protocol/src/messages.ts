@@ -11,6 +11,33 @@ export type SessionState = z.infer<typeof sessionStateSchema>;
 export const effortSchema = z.enum(['low', 'medium', 'high', 'xhigh', 'max']);
 export type Effort = z.infer<typeof effortSchema>;
 
+export const screenWatchSettingsSchema = z.object({
+  intervalMs: z.number().int().min(500).max(3000).default(1000),
+  changeThreshold: z.number().min(0.01).max(1).default(0.08),
+  settleMs: z.number().int().min(500).max(5000).default(1500),
+  display: z.number().int().min(0).default(0),
+  maxPerMinute: z.number().int().min(1).max(4).default(4),
+  maxPerHour: z.number().int().min(1).max(60).default(60),
+  retainFrames: z.number().int().min(1).max(10).default(2),
+});
+export type ScreenWatchSettings = z.infer<typeof screenWatchSettingsSchema>;
+export const DEFAULT_SCREEN_WATCH_SETTINGS: Readonly<ScreenWatchSettings> = Object.freeze(screenWatchSettingsSchema.parse({}));
+
+const watchIdSchema = z.string().min(1).max(128);
+const watchGoalSchema = z.string().max(1000);
+export const screenWatchReasonSchema = z.enum(['user', 'idle', 'locked', 'sleep', 'offline', 'limit', 'error', 'killed', 'replaced']);
+export type ScreenWatchReason = z.infer<typeof screenWatchReasonSchema>;
+export const screenWatchStatusSchema = z.object({
+  sessionId: watchIdSchema,
+  watchId: watchIdSchema,
+  deviceId: watchIdSchema,
+  state: z.enum(['off', 'watching', 'paused']),
+  reason: screenWatchReasonSchema.optional(),
+  goal: watchGoalSchema.optional(),
+  settings: screenWatchSettingsSchema,
+});
+export type ScreenWatchStatus = z.infer<typeof screenWatchStatusSchema>;
+
 export const sessionMetaSchema = z.object({
   sessionId: z.string(),
   title: z.string(),
@@ -28,6 +55,7 @@ export const sessionMetaSchema = z.object({
   hidden: z.boolean().optional(),
   /** The person the chat belongs to; the brain shows each client only its own person's chats. */
   userId: z.string().optional(),
+  watch: screenWatchStatusSchema.optional(),
   /** Claude Code session behind this chat; it is tied to a working directory, so moving the chat starts a new one. */
   engine: z.object({ id: z.string(), cwd: z.string() }).optional(),
 });
@@ -43,9 +71,11 @@ export const sessionEventSchema = z.discriminatedUnion('kind', [
     files: z.array(z.string()).optional(),
     /** Spoken on a call. */
     voice: z.boolean().optional(),
+    observation: z.boolean().optional(),
   }),
   z.object({ kind: z.literal('text_delta'), text: z.string() }),
-  z.object({ kind: z.literal('text'), text: z.string() }),
+  z.object({ kind: z.literal('text'), text: z.string(), observation: z.boolean().optional() }),
+  z.object({ kind: z.literal('screen_watch'), at: z.number(), text: z.string() }),
   z.object({ kind: z.literal('tool_use'), id: z.string(), name: z.string(), input: z.unknown() }),
   z.object({ kind: z.literal('tool_output'), id: z.string(), chunk: z.string(), stream: z.enum(['stdout', 'stderr']) }),
   z.object({ kind: z.literal('tool_result'), id: z.string(), content: z.string(), isError: z.boolean() }),
@@ -56,6 +86,7 @@ export const sessionEventSchema = z.discriminatedUnion('kind', [
     costUsd: z.number().optional(),
     inputTokens: z.number().optional(),
     outputTokens: z.number().optional(),
+    observation: z.boolean().optional(),
   }),
   z.object({ kind: z.literal('error'), message: z.string() }),
 ]);
@@ -78,6 +109,31 @@ export type ClipboardItem = z.infer<typeof clipboardItemSchema>;
 /** A downscaled picture of a computer's screen (all monitors), small enough for Claude to look at. */
 export const screenImageSchema = z.object({ mime: z.string(), dataBase64: z.string(), width: z.number().int().positive(), height: z.number().int().positive() });
 export type ScreenImage = z.infer<typeof screenImageSchema>;
+
+const changedRegionSchema = z.object({
+  x: z.number().min(0).max(1), y: z.number().min(0).max(1),
+  width: z.number().positive().max(1), height: z.number().positive().max(1),
+}).refine((region) => region.x + region.width <= 1.000001 && region.y + region.height <= 1.000001, 'Region must fit the selected display');
+
+/** Only observation images are bounded; manual screenshots and zoom keep their existing format. */
+export const screenWatchFrameSchema = z.object({
+  sessionId: watchIdSchema,
+  watchId: watchIdSchema,
+  frameId: watchIdSchema,
+  capturedAt: z.number().int().nonnegative(),
+  image: screenImageSchema.extend({
+    mime: z.literal('image/jpeg'),
+    dataBase64: z.string().min(1).max(4_000_000),
+    width: z.number().int().positive().max(1280),
+    height: z.number().int().positive().max(800),
+  }),
+  windowTitle: z.string().max(2048),
+  processName: z.string().max(260),
+  display: z.number().int().min(0),
+  changedRegion: changedRegionSchema.optional(),
+  requestId: watchIdSchema.optional(),
+});
+export type ScreenWatchFrame = z.infer<typeof screenWatchFrameSchema>;
 
 const px = z.number().int();
 const size = z.number().int().positive();
@@ -256,6 +312,8 @@ export const innerMessageBodySchema = z.discriminatedUnion('type', [
   m('clipboard.set', z.object({ requestId: z.string(), deviceId: z.string(), item: clipboardItemSchema })),
   /** Asks a computer for a picture of its screen right now. */
   m('screen.get', z.object({ requestId: z.string(), deviceId: z.string() })),
+  /** The brain resolves the PC from this person's chat; clients cannot choose another person's device. */
+  m('screen.watch.set', z.object({ sessionId: watchIdSchema, enabled: z.boolean(), goal: watchGoalSchema.optional(), settings: screenWatchSettingsSchema.partial().optional() })),
   m('computer.remove', z.object({ deviceId: z.string() })),
   /** Owner only: asks for an invite link that registers a new person with their own phone, computers and chats. */
   m('user.invite', z.object({})),
@@ -323,6 +381,10 @@ export const innerMessageBodySchema = z.discriminatedUnion('type', [
   m('clipboard.done', z.object({ requestId: z.string(), error: z.string().optional() })),
   m('screen.capture', z.object({ requestId: z.string() })),
   m('screen.image', z.object({ requestId: z.string(), image: screenImageSchema.optional(), error: z.string().optional() })),
+  m('screen.watch.control', z.object({ sessionId: watchIdSchema, watchId: watchIdSchema, enabled: z.boolean(), settings: screenWatchSettingsSchema, goal: watchGoalSchema.optional() })),
+  m('screen.watch.capture', z.object({ sessionId: watchIdSchema, watchId: watchIdSchema, requestId: watchIdSchema })),
+  m('screen.watch.frame', screenWatchFrameSchema),
+  m('screen.watch.status', screenWatchStatusSchema),
   /** Computer use on a computer with the 'computer' capability (PocketClipboard on Windows). */
   m('computer.act', z.object({ requestId: z.string(), action: computerActionSchema })),
   m('computer.done', computerResultSchema.extend({ requestId: z.string(), error: z.string().optional() })),
@@ -337,9 +399,11 @@ export const innerMessageBodySchema = z.discriminatedUnion('type', [
     /**
      * What this computer offers: 'tools' (VS Code extension), 'clipboard' (PocketClipboard), 'screenshot' (PocketClipboard answers screen.capture),
      * 'overlay' (PocketClipboard shows the chat on screen: it receives session events, may list sessions, read history and write text into its person's chats),
-     * 'computer' (PocketClipboard answers computer.act: screen, mouse, keyboard, windows).
+     * 'computer' (PocketClipboard answers computer.act: screen, mouse, keyboard, windows),
+     * 'watch' (PocketClipboard samples its unlocked screen in the persistent computer host).
      */
     capabilities: z.array(z.string()).optional(),
+    watch: screenWatchStatusSchema.optional(),
   })),
 
   // brain → every device
