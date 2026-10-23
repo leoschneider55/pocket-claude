@@ -79,6 +79,7 @@ async function connect(code: PairingCode, role: 'executor' | 'client', name: str
   return {
     deviceId: joined.deviceId,
     send: (body: InnerMessageBody) => link.send(brainId, body),
+    close: () => link.close(),
     inbox,
     next,
     /** Sends a request and returns the first reply of the given type that arrives after it. */
@@ -191,5 +192,81 @@ describe('people', () => {
     expect(brain.users().map((u) => u.name)).toEqual([expect.any(String), 'Petya']);
     expect(brain.status().devices.map((d) => d.name)).toEqual(['owner-phone', 'petya-phone']);
     expect(brain.status().sessions.map((s) => s.title)).toEqual(['Owner chat']);
+  });
+
+  it('routes screen watching only to the chat owner’s selected PC and rejects stale events', async () => {
+    const owner = await connect(parsePairingUri(brain.startPairing().uri).code, 'client', 'watch-owner-phone');
+    const invite = brain.startPairing(undefined, { invite: {} });
+    const guest = await connect(parsePairingUri(invite.uri).code, 'client', 'watch-guest-phone', 'Watch guest');
+    const session = await guest.ask({ type: 'session.create', payload: { title: 'Watch chat' } }, 'session.created');
+    const sessionId = session.payload.session.sessionId;
+    const ownerPairing = await owner.ask({ type: 'computer.pair', payload: {} }, 'computer.pairing');
+    const ownerPc = await connect(parsePairingCode(ownerPairing.payload.code), 'executor', 'watch-owner-pc');
+    ownerPc.send({ type: 'executor.status', payload: { workspaces: [], os: 'win32', shell: 'none', capabilities: ['watch'] } });
+    const guestPairing = await guest.ask({ type: 'computer.pair', payload: {} }, 'computer.pairing');
+    const guestPc = await connect(parsePairingCode(guestPairing.payload.code), 'executor', 'watch-guest-pc');
+    guestPc.send({ type: 'executor.status', payload: { workspaces: [], os: 'win32', shell: 'none', capabilities: ['watch'] } });
+    await guest.ask({ type: 'computer.select', payload: { deviceId: guestPc.deviceId, sessionId } }, 'computers.result');
+
+    const ownerInboxMark = owner.inbox.length;
+    const crossUser = owner.ask({ type: 'screen.watch.set', payload: { sessionId, enabled: true } }, 'error');
+    expect((await crossUser).payload.code).toBe('unknown_session');
+    const watchMark = guest.inbox.length;
+    guest.send({ type: 'screen.watch.set', payload: { sessionId, enabled: true, goal: 'build finishes' } });
+    const control = await guestPc.next('screen.watch.control', 0, (m) => m.payload.enabled);
+    const started = await guest.next('screen.watch.status', watchMark, (m) => m.payload.sessionId === sessionId && m.payload.state === 'watching');
+    console.log('watch-started', started.payload.watchId);
+    expect(control.payload).toMatchObject({ sessionId, watchId: started.payload.watchId, enabled: true, goal: 'build finishes' });
+    expect(owner.inbox.slice(ownerInboxMark).some((m) => m.type === 'screen.watch.status' && m.payload.sessionId === sessionId)).toBe(false);
+
+    const frame = {
+      sessionId,
+      watchId: started.payload.watchId,
+      frameId: 'foreign-frame',
+      capturedAt: Date.now(),
+      image: { mime: 'image/jpeg' as const, dataBase64: 'AAAA', width: 16, height: 9 },
+      windowTitle: 'Private window',
+      processName: 'notepad.exe',
+      display: 0,
+    };
+    ownerPc.send({ type: 'screen.watch.frame', payload: frame });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(guest.inbox.some((m) => m.type === 'session.event' && m.payload.sessionId === sessionId && m.payload.event.kind === 'screen_watch')).toBe(false);
+
+    const lockMark = guest.inbox.length;
+    guestPc.send({ type: 'screen.watch.status', payload: { ...started.payload, state: 'off', reason: 'locked' } });
+    const locked = await guest.next('screen.watch.status', lockMark, (m) => m.payload.sessionId === sessionId && m.payload.state === 'off' && m.payload.reason === 'locked');
+    console.log('watch-locked', locked.payload.watchId);
+    expect(locked.payload.reason).toBe('locked');
+    await guestPc.next('screen.watch.control', 0, (m) => !m.payload.enabled && m.payload.watchId === started.payload.watchId);
+    const lockEventMark = guest.inbox.length;
+    const staleReplay = { ...frame, frameId: 'replayed-frame' };
+    guestPc.send({ type: 'screen.watch.frame', payload: staleReplay });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(guest.inbox.slice(lockEventMark).some((m) => m.type === 'session.event' && m.payload.event.kind === 'screen_watch')).toBe(false);
+
+    const nextMark = guest.inbox.length;
+    guest.send({ type: 'screen.watch.set', payload: { sessionId, enabled: true } });
+    const restarted = await guest.next('screen.watch.status', nextMark, (m) => m.payload.sessionId === sessionId && m.payload.state === 'watching');
+    console.log('watch-restarted', restarted.payload.watchId);
+    const killMark = guest.inbox.length;
+    guest.send({ type: 'control.kill', payload: {} });
+    const killed = await guest.next('screen.watch.status', killMark, (m) => m.payload.sessionId === sessionId && m.payload.state === 'off' && m.payload.reason === 'killed');
+    console.log('watch-killed', killed.payload.watchId);
+    expect(killed.payload.watchId).toBe(restarted.payload.watchId);
+    const afterKillMark = guest.inbox.length;
+    guestPc.send({ type: 'screen.watch.frame', payload: { ...frame, watchId: restarted.payload.watchId, frameId: 'after-kill' } });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(guest.inbox.slice(afterKillMark).some((m) => m.type === 'session.event' && m.payload.event.kind === 'screen_watch')).toBe(false);
+
+    const offlineStartMark = guest.inbox.length;
+    guest.send({ type: 'screen.watch.set', payload: { sessionId, enabled: true } });
+    const offlineWatch = await guest.next('screen.watch.status', offlineStartMark, (m) => m.payload.sessionId === sessionId && m.payload.state === 'watching');
+    console.log('watch-offline-started', offlineWatch.payload.watchId);
+    guestPc.close();
+    const offline = await guest.next('screen.watch.status', guest.inbox.length, (m) => m.payload.sessionId === sessionId && m.payload.state === 'off' && m.payload.reason === 'offline');
+    console.log('watch-offline', offline.payload.watchId);
+    expect(offline.payload.watchId).toBe(offlineWatch.payload.watchId);
+    expect((await guest.ask({ type: 'screen.watch.set', payload: { sessionId, enabled: true } }, 'error')).payload.code).toBe('screen_watch_failed');
   });
 });
