@@ -52,6 +52,8 @@ export function itemPieces(item: ChatItem): Piece[] {
       return [{ kind: 'tool', text: `${shortToolName(item.name)} ${summarizeTool(item.input)}`.trim(), failed: item.result?.isError === true }];
     case 'error':
       return [{ kind: 'error', text: item.message }];
+    case 'screen_watch':
+      return [{ kind: 'para', inline: [{ text: item.text, italic: true }] }];
     case 'user':
     case 'result':
       return [];
