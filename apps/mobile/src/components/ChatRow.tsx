@@ -17,6 +17,7 @@ const INDENT = AVATAR + 8;
 function ChatRowImpl({ item, persona }: { item: ChatItem; persona?: Persona }) {
   switch (item.type) {
     case 'user':
+      if (item.observation) return null;
       return (
         <View style={styles.userWrap}>
           <LinearGradient colors={ownBubble} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={styles.userBubble}>
@@ -41,6 +42,7 @@ function ChatRowImpl({ item, persona }: { item: ChatItem; persona?: Persona }) {
         </View>
       );
     case 'assistant':
+      if (item.observation && item.streaming) return null;
       return (
         <View>
           <View style={styles.assistantWrap}>
@@ -63,7 +65,14 @@ function ChatRowImpl({ item, persona }: { item: ChatItem; persona?: Persona }) {
         </View>
       );
     case 'result':
+      if (item.observation) return null;
       return <Text style={styles.result}>{formatResult(item.durationMs, item.costUsd)}</Text>;
+    case 'screen_watch':
+      return (
+        <View style={styles.screenWatch} accessibilityLabel={`Screen change: ${item.text}`}>
+          <Text style={styles.screenWatchText}>{item.text.startsWith('👁') ? item.text : `👁 ${item.text}`}</Text>
+        </View>
+      );
     case 'error':
       return (
         <View style={styles.error}>
@@ -94,6 +103,8 @@ const styles = StyleSheet.create({
   replyActions: { flexDirection: 'row', gap: 8, paddingLeft: INDENT, paddingTop: 4 },
   toolWrap: { paddingLeft: INDENT, paddingRight: 24 },
   result: { color: colors.textMuted, fontSize: 11, textAlign: 'center', opacity: 0.8 },
+  screenWatch: { alignSelf: 'center', maxWidth: '96%', paddingHorizontal: 10, paddingVertical: 4, borderRadius: 12, backgroundColor: colors.surface },
+  screenWatchText: { color: colors.textMuted, fontSize: 11, textAlign: 'center' },
   error: {
     marginLeft: INDENT,
     backgroundColor: colors.dangerSoft,
