@@ -1,5 +1,5 @@
 import { applyEvent, buildThread, parseRichMarkdown, type ChatItem, type RichBlock } from '@pocket/client-core';
-import type { InnerMessageBody, SessionMeta, SessionState } from '@pocket/protocol';
+import { DEFAULT_SCREEN_WATCH_SETTINGS, type InnerMessageBody, type ScreenWatchStatus, type SessionMeta, type SessionState } from '@pocket/protocol';
 import { actionTitle, attachmentsAction, groupOf, runState, toolAction, type ActionState, type OverlayAction, type ToolItem } from './actions.js';
 
 export type OverlayTheme = 'dark' | 'light';
@@ -34,6 +34,7 @@ export type OverlayMessage =
 export interface OverlayStatus {
   text: string;
   tone: OverlayTone;
+  watching?: boolean;
 }
 
 /** One chat in the window's side list. */
@@ -94,6 +95,7 @@ const OFFLINE = 'Mac не в сети, сообщение не отправле�
  */
 export class OverlayModel {
   private readonly sessions = new Map<string, SessionMeta>();
+  private readonly watchBySession = new Map<string, ScreenWatchStatus>();
   private readonly threads = new Map<string, ChatItem[]>();
   private readonly loaded = new Set<string>();
   private readonly requested = new Set<string>();
@@ -143,6 +145,16 @@ export class OverlayModel {
     if (error) return this.deps.window({ op: 'unsent', text: body, error });
     this.pending = { chatId, text: body, timer: setTimeout(() => this.unsent(NO_REPLY), SEND_TIMEOUT_MS) };
     this.deps.request({ type: 'message.send', payload: { sessionId: chatId, text: body } });
+  }
+
+  toggleWatch(): void {
+    if (!this.activeId) return;
+    const status = this.watchBySession.get(this.activeId) ?? this.sessions.get(this.activeId)?.watch;
+    const enabled = status?.state !== 'watching' && status?.state !== 'paused';
+    this.deps.request({
+      type: 'screen.watch.set',
+      payload: { sessionId: this.activeId, enabled, ...(enabled ? { settings: DEFAULT_SCREEN_WATCH_SETTINGS } : {}) },
+    });
   }
 
   /** The user picked a chat in the window's list. */
