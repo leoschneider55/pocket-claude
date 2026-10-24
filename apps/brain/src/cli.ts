@@ -6,6 +6,7 @@ import { fileStore, PocketBot } from '@pocket/telegram-bot';
 import qrcode from 'qrcode-terminal';
 import { WebSocket as NodeWebSocket } from 'ws';
 import type { WebSocketCtor } from '@pocket/transport';
+import { maskApiKey, readApiKey, removeApiKey, saveApiKey } from './api-key.js';
 import { Brain, type BrainStatus, type PairingTicket, type UserSummary } from './daemon.js';
 import { log, logToStderr } from './log.js';
 import { ensureDirs, loadOrCreateIdentity, loadState, paths, saveState } from './store.js';
@@ -337,6 +338,23 @@ async function main(): Promise<void> {
       else throw new Error('Usage: pocket-claude allow [list | add <rule> | remove <rule>]\n  rule: write_file | run_command:<command prefix>');
       return console.log(rules.length ? rules.map((r) => `  ${r}`).join('\n') : '  (empty — every write and command asks for approval)');
     }
+    case 'api-key': {
+      const sub = process.argv[3];
+      if (sub === 'set') {
+        // Read from stdin so the key never lands in shell history or the process list.
+        ensureDirs();
+        const key = process.stdin.isTTY ? await promptHidden('Anthropic API key: ') : readFileSync(0, 'utf8');
+        saveApiKey(key);
+        return console.log(`Saved ${maskApiKey(key.trim())}. Chats switched to the API ("switch to the API") bill it from their next reply.`);
+      }
+      if (sub === 'remove') {
+        removeApiKey();
+        return console.log('Removed. API-billed chats go back to the subscription on their next start.');
+      }
+      if (sub && sub !== 'status') throw new Error('Usage: pocket-claude api-key [status | set | remove]  (set reads the key from stdin)');
+      const key = readApiKey();
+      return console.log(key ? `API key ${maskApiKey(key)}` : 'No API key: pocket-claude api-key set');
+    }
     case 'usage':
       return printUsage(Number(arg ?? 14));
     case 'search':
@@ -382,3 +400,28 @@ main().catch((e) => {
   console.error(e instanceof Error ? e.message : String(e));
   process.exit(1);
 });
+
+function promptHidden(question: string): Promise<string> {
+  return new Promise((resolve) => {
+    process.stdout.write(question);
+    const stdin = process.stdin;
+    stdin.setRawMode(true);
+    stdin.resume();
+    let value = '';
+    const onData = (d: Buffer) => {
+      for (const ch of d.toString('utf8')) {
+        if (ch === '\r' || ch === '\n') {
+          stdin.setRawMode(false);
+          stdin.pause();
+          stdin.off('data', onData);
+          process.stdout.write('\n');
+          return resolve(value);
+        }
+        if (ch === '\u0003') process.exit(130);
+        if (ch === '\u007f') value = value.slice(0, -1);
+        else value += ch;
+      }
+    };
+    stdin.on('data', onData);
+  });
+}
