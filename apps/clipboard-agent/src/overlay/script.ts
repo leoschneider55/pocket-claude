@@ -1,7 +1,7 @@
 /**
  * The overlay window: Windows PowerShell 5.1 hosting a WPF window written in C# (compiled by Add-Type at start), driven by
- * the agent over stdin/stdout (one JSON object per line). It shows the chat, copies text, and hands what the user types to
- * the agent, which sends it to the chat on screen. Double-tap Alt shows it without taking focus; a click into the input
+ * the agent over stdin/stdout (one JSON object per line). It shows the chat, copies text, and hands what the user types or
+ * picks (the chat's model and thinking level) to the agent, which passes it to the chat on screen. Double-tap Alt shows it without taking focus; a click into the input
  * field focuses it for typing. A single Alt tap (or Esc) hides it.
  *
  * Kept as a string so the single-file PocketClipboard.exe can write it next to its state and run it. Because this is a
@@ -38,6 +38,7 @@ using System.Windows.Interop;
 using System.Windows.Markup;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
+using System.Windows.Media.Effects;
 using System.Windows.Shapes;
 using System.Windows.Threading;
 
@@ -94,7 +95,7 @@ namespace PocketOverlay
 
     public sealed class Overlay
     {
-        const double WinWidth = 460, CompactHeight = 640, Gap = 12, DrawerWidth = 300;
+        const double WinWidth = 460, CompactHeight = 660, Gap = 12, DrawerWidth = 300;
         // Long chats draw their last messages first; older ones come on demand, so opening a chat stays quick.
         const int RenderLimit = 150;
         const string BareXaml =
@@ -157,6 +158,13 @@ namespace PocketOverlay
         // What is typed survives a theme switch, which rebuilds the window.
         string draft = "";
         bool sending;
+        // The model and thinking pickers: data from the agent, the chips in the input box and their menu.
+        IDictionary<string, object> config;
+        Button modelPill, effortPill;
+        TextBlock modelPillText, effortPillText;
+        Grid layer, menuLayer, menuHost;
+        StackPanel menuItems;
+        string menuKind;
 
         IList chats = None;
         string chatId = "", titleText = "Pocket", statusText = "", statusTone = "idle";
@@ -254,8 +262,13 @@ namespace PocketOverlay
             Put(root, BuildHeader(), 0, 0);
             Put(root, BuildBody(), 0, 1);
             Put(root, BuildFooter(), 0, 2);
-            win.Content = new Border { BorderBrush = P.Edge, BorderThickness = new Thickness(1), Child = root };
+            layer = new Grid();
+            layer.Children.Add(root);
+            layer.Children.Add(BuildMenuLayer());
+            win.Content = new Border { BorderBrush = P.Edge, BorderThickness = new Thickness(1), Child = layer };
             drawerOpen = false;
+            menuKind = null;
+            ApplyConfig();
             ApplyStatus();
             RenderAll();
             RenderChats();
@@ -410,9 +423,6 @@ namespace PocketOverlay
 
         FrameworkElement BuildComposer()
         {
-            var g = new Grid { Margin = new Thickness(10, 0, 10, 10) };
-            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            g.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             composer = new TextBox
             {
                 AcceptsReturn = true, TextWrapping = TextWrapping.Wrap, MinHeight = 22, MaxHeight = 132, Padding = new Thickness(0),
@@ -436,27 +446,193 @@ namespace PocketOverlay
                 Foreground = P.Faint, FontSize = 14, Margin = new Thickness(2, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center,
                 IsHitTestVisible = false, TextTrimming = TextTrimming.CharacterEllipsis,
             };
-            var field = new Grid();
+            var field = new Grid { Margin = new Thickness(2, 0, 2, 0) };
             field.Children.Add(composerHint);
             field.Children.Add(composer);
-            composerBox = new Border
-            {
-                Background = P.ChipBg, BorderBrush = P.Edge, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(19),
-                Padding = new Thickness(14, 7, 10, 7), MinHeight = 38, Cursor = Cursors.IBeam, Child = field,
-            };
-            // A click on the padding around the text focuses it too.
-            composerBox.MouseLeftButtonDown += delegate { composer.Focus(); };
-            Put(g, composerBox, 0, 0);
-            sendIcon = Icon("\uE724", P.Faint, 14);
+
+            var bottom = new Grid { Margin = new Thickness(0, 6, 0, 0) };
+            bottom.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            bottom.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            bottom.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            bottom.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            modelPill = Pill("\u273B", true, "model", out modelPillText, delegate { ToggleMenu("model", modelPill); });
+            modelPill.Margin = new Thickness(-4, 0, 0, 0);
+            Put(bottom, modelPill, 0, 0);
+            effortPill = Pill("\uEA80", false, "effort", out effortPillText, delegate { ToggleMenu("effort", effortPill); });
+            effortPill.Margin = new Thickness(2, 0, 0, 0);
+            Put(bottom, effortPill, 1, 0);
+            sendIcon = Icon("\uE724", P.Faint, 13);
             sendIcon.HorizontalAlignment = HorizontalAlignment.Center;
             sendIcon.Margin = new Thickness(2, 0, 0, 0);
-            sendBox = new Border { Width = 38, Height = 38, CornerRadius = new CornerRadius(19), Child = sendIcon };
+            sendBox = new Border { Width = 32, Height = 32, CornerRadius = new CornerRadius(16), Child = sendIcon };
             sendButton = MakeButton(sendBox, "send", "Отправить", Send);
             sendButton.ToolTip = "Отправить: Enter. Новая строка: Shift+Enter";
             sendButton.Margin = new Thickness(8, 0, 0, 0);
             sendButton.VerticalAlignment = VerticalAlignment.Bottom;
-            Put(g, sendButton, 1, 0);
-            return g;
+            Put(bottom, sendButton, 3, 0);
+
+            var inner = new StackPanel();
+            inner.Children.Add(field);
+            inner.Children.Add(bottom);
+            composerBox = new Border
+            {
+                Background = P.ChipBg, BorderBrush = P.Edge, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(16),
+                Padding = new Thickness(12, 9, 7, 7), Margin = new Thickness(10, 0, 10, 10), Cursor = Cursors.IBeam, Child = inner,
+            };
+            // A click on the padding around the text focuses it too; the chips and the button handle their own clicks.
+            composerBox.MouseLeftButtonDown += delegate { composer.Focus(); };
+            return composerBox;
+        }
+
+        Button Pill(string glyph, bool symbol, string id, out TextBlock text, Action click)
+        {
+            var row = new StackPanel { Orientation = Orientation.Horizontal };
+            TextBlock icon = symbol
+                ? new TextBlock { Text = glyph, FontFamily = SymbolFont, FontSize = 12.5, Foreground = P.Accent, VerticalAlignment = VerticalAlignment.Center }
+                : Icon(glyph, P.Muted, 12);
+            icon.Margin = new Thickness(0, 0, 5, 0);
+            row.Children.Add(icon);
+            text = new TextBlock { Foreground = P.Text, FontSize = 12.5, VerticalAlignment = VerticalAlignment.Center, MaxWidth = 170, TextTrimming = TextTrimming.CharacterEllipsis };
+            row.Children.Add(text);
+            var chevron = Icon("\uE70D", P.Faint, 8);
+            chevron.Margin = new Thickness(6, 1, 0, 0);
+            row.Children.Add(chevron);
+            var box = new Border { CornerRadius = new CornerRadius(8), Padding = new Thickness(7, 4, 7, 5), Background = Brushes.Transparent, Child = row };
+            var b = MakeButton(box, id, id, click);
+            b.VerticalAlignment = VerticalAlignment.Center;
+            b.Visibility = Visibility.Collapsed;
+            Hover(b, box, Brushes.Transparent, P.ChipHover);
+            return b;
+        }
+
+        // ---------------------------------------------------------------- model and thinking
+
+        void ApplyConfig()
+        {
+            if (modelPill == null) return;
+            SetPill(modelPill, modelPillText, D(config, "model"), false);
+            SetPill(effortPill, effortPillText, D(config, "effort"), true);
+            if (menuKind != null)
+            {
+                if (D(config, menuKind) == null) CloseMenu();
+                else FillMenu();
+            }
+            UpdateComposer();
+        }
+
+        static void SetPill(Button pill, TextBlock text, IDictionary<string, object> picker, bool titled)
+        {
+            if (picker == null)
+            {
+                pill.Visibility = Visibility.Collapsed;
+                return;
+            }
+            string title = S(picker, "title"), label = S(picker, "label");
+            text.Text = titled ? title + ": " + label : label;
+            AutomationProperties.SetName(pill, title + ": " + label);
+            pill.ToolTip = title;
+            pill.Visibility = Visibility.Visible;
+        }
+
+        FrameworkElement BuildMenuLayer()
+        {
+            menuItems = new StackPanel();
+            var menu = new Border
+            {
+                Background = P.Drawer, BorderBrush = P.Edge, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(10), Padding = new Thickness(4),
+                Child = new ScrollViewer
+                {
+                    Content = menuItems, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled, Focusable = false,
+                },
+            };
+            // The shadow sits on its own layer: an effect on the menu itself would turn off ClearType for its text.
+            var shadow = new Border
+            {
+                Background = P.Drawer, CornerRadius = new CornerRadius(10),
+                Effect = new DropShadowEffect { BlurRadius = 18, ShadowDepth = 2, Opacity = 0.35, Color = Colors.Black },
+            };
+            menuHost = new Grid { HorizontalAlignment = HorizontalAlignment.Left, VerticalAlignment = VerticalAlignment.Bottom };
+            menuHost.Children.Add(shadow);
+            menuHost.Children.Add(menu);
+            // A click in the menu stays there; anywhere else in the window closes it.
+            menuHost.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e) { e.Handled = true; };
+            menuLayer = new Grid { Background = Brushes.Transparent, Visibility = Visibility.Collapsed };
+            menuLayer.MouseLeftButtonDown += delegate { CloseMenu(); };
+            menuLayer.Children.Add(menuHost);
+            return menuLayer;
+        }
+
+        void ToggleMenu(string kind, FrameworkElement anchor)
+        {
+            if (menuKind == kind)
+            {
+                CloseMenu();
+                return;
+            }
+            if (D(config, kind) == null) return;
+            if (drawerOpen) CloseDrawer();
+            menuKind = kind;
+            FillMenu();
+            // Opens upward from the chip, inside the window.
+            Point at = anchor.TranslatePoint(new Point(0, 0), layer);
+            double width = kind == "model" ? 310 : 270;
+            menuHost.Width = width;
+            menuHost.MaxHeight = Math.Max(140, at.Y - 12);
+            menuHost.Margin = new Thickness(Math.Max(8, Math.Min(at.X - 4, layer.ActualWidth - width - 8)), 0, 0, Math.Max(0, layer.ActualHeight - at.Y + 6));
+            menuLayer.Visibility = Visibility.Visible;
+        }
+
+        void CloseMenu()
+        {
+            menuKind = null;
+            if (menuLayer != null) menuLayer.Visibility = Visibility.Collapsed;
+        }
+
+        void FillMenu()
+        {
+            menuItems.Children.Clear();
+            var picker = D(config, menuKind);
+            if (picker == null) return;
+            var head = OneLine(S(picker, "title"), P.Faint, 11.5);
+            head.FontWeight = FontWeights.SemiBold;
+            head.Margin = new Thickness(10, 6, 10, 4);
+            menuItems.Children.Add(head);
+            foreach (object o in L(picker, "options") ?? None)
+            {
+                var option = o as IDictionary<string, object>;
+                if (option != null) menuItems.Children.Add(MenuOption(menuKind, option));
+            }
+        }
+
+        FrameworkElement MenuOption(string kind, IDictionary<string, object> option)
+        {
+            string value = S(option, "value");
+            bool selected = B(option, "selected");
+            var g = new Grid();
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(22) });
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            if (selected)
+            {
+                var check = Icon("\uE73E", P.Accent, 11);
+                check.VerticalAlignment = VerticalAlignment.Top;
+                check.Margin = new Thickness(0, 3, 0, 0);
+                Put(g, check, 0, 0);
+            }
+            var texts = new StackPanel();
+            var label = OneLine(S(option, "label"), P.Text, 13.5);
+            if (selected) label.FontWeight = FontWeights.SemiBold;
+            texts.Children.Add(label);
+            string detail = S(option, "detail");
+            if (detail.Length > 0) texts.Children.Add(new TextBlock { Text = detail, Foreground = P.Muted, FontSize = 11.5, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 1, 0, 0) });
+            Put(g, texts, 1, 0);
+            var box = new Border { CornerRadius = new CornerRadius(7), Padding = new Thickness(8, 6, 10, 7), Background = Brushes.Transparent, Child = g };
+            var b = MakeButton(box, kind + ":" + value, S(option, "label"), delegate
+            {
+                CloseMenu();
+                if (!selected) Emit("configure", "chatId", chatId, kind, value);
+            });
+            Hover(b, box, Brushes.Transparent, P.ChipHover);
+            return b;
         }
 
         bool CanWrite()
@@ -466,7 +642,7 @@ namespace PocketOverlay
 
         void UpdateComposer()
         {
-            if (composer == null) return;
+            if (composer == null || modelPill == null) return;
             bool can = CanWrite();
             composer.IsReadOnly = sending;
             composerBox.Opacity = sending ? 0.6 : 1;
@@ -478,6 +654,13 @@ namespace PocketOverlay
             sendBox.Background = ready ? P.Accent : P.ChipBg;
             sendIcon.Foreground = ready ? Brushes.White : P.Faint;
             sendIcon.Text = sending ? "\uE712" : "\uE724";
+            // Pickers wait while a change is on its way, and cannot change anything without the Mac.
+            bool pickable = can && !B(config, "pending");
+            modelPill.IsEnabled = pickable;
+            effortPill.IsEnabled = pickable;
+            modelPill.Opacity = pickable ? 1 : 0.55;
+            effortPill.Opacity = pickable ? 1 : 0.55;
+            if (!can) CloseMenu();
         }
 
         void OnComposerKey(object sender, KeyEventArgs e)
@@ -667,6 +850,7 @@ namespace PocketOverlay
                 case "title": titleText = S(op, "title"); ApplyStatus(); break;
                 case "status": SetStatus(D(op, "status")); break;
                 case "chats": chats = L(op, "chats") ?? None; chatsDirty = true; break;
+                case "config": config = D(op, "config"); ApplyConfig(); break;
                 case "theme": SetTheme(S(op, "theme")); break;
                 case "sent": Sent(S(op, "text")); break;
                 case "unsent": Unsent(S(op, "text"), S(op, "error")); break;
@@ -686,6 +870,7 @@ namespace PocketOverlay
                 selectedId = null;
                 autoScroll = true;
                 ClearSendError();
+                CloseMenu();
             }
             chatId = id;
             titleText = S(op, "title");
@@ -693,6 +878,8 @@ namespace PocketOverlay
             IList list = L(op, "chats");
             if (list != null) { chats = list; chatsDirty = true; }
             loading = B(op, "loading");
+            config = D(op, "config");
+            ApplyConfig();
             rows.Clear();
             foreach (object o in L(op, "messages") ?? None)
             {
@@ -1245,6 +1432,7 @@ namespace PocketOverlay
         void OpenDrawer()
         {
             if (drawerOpen) return;
+            CloseMenu();
             drawerOpen = true;
             drawer.Visibility = Visibility.Visible;
             scrim.Visibility = Visibility.Visible;
@@ -1430,7 +1618,8 @@ namespace PocketOverlay
         void OnKey(object sender, KeyEventArgs e)
         {
             if (e.Key != Key.Escape) return;
-            if (drawerOpen) CloseDrawer();
+            if (menuKind != null) CloseMenu();
+            else if (drawerOpen) CloseDrawer();
             else HideOverlay();
             e.Handled = true;
         }
@@ -1446,6 +1635,7 @@ namespace PocketOverlay
         void HideOverlay()
         {
             if (!win.IsVisible) return;
+            CloseMenu();
             win.Hide();
             Emit("visible", "visible", false);
         }

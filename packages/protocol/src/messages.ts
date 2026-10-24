@@ -57,6 +57,8 @@ export const sessionMetaSchema = z.object({
   lastText: z.string().optional(),
   model: z.string().optional(),
   effort: effortSchema.optional(),
+  /** Who pays for this chat: 'api' bills the owner's Anthropic API key; unset means the Claude subscription. */
+  billing: z.literal('api').optional(),
   /** The computer this chat works on; unset means the account's active computer. */
   executorId: z.string().optional(),
   /** Project folder on that computer; unset means the folders open in VS Code. */
@@ -408,9 +410,9 @@ export const innerMessageBodySchema = z.discriminatedUnion('type', [
     projects: z.array(projectSchema).optional(),
     /**
      * What this computer offers: 'tools' (VS Code extension), 'clipboard' (PocketClipboard), 'screenshot' (PocketClipboard answers screen.capture),
-     * 'overlay' (PocketClipboard shows the chat on screen: it receives session events, may list sessions, read history and write text into its person's chats),
-     * 'computer' (PocketClipboard answers computer.act: screen, mouse, keyboard, windows),
+     * 'overlay' (PocketClipboard shows the chat on screen: it receives session events, may list sessions, read history, list models, and write text into its person's chats and set their model and thinking level),
      * 'watch' (PocketClipboard samples its unlocked screen in the persistent computer host).
+     * 'computer' (PocketClipboard answers computer.act: screen, mouse, keyboard, windows).
      */
     capabilities: z.array(z.string()).optional(),
     watch: screenWatchStatusSchema.optional(),

@@ -133,9 +133,7 @@ async function run(): Promise<void> {
       snapshot: () => model.snapshot(),
       log,
       onEvent: (e) => {
-        if (e.ev === 'open') return model.open(e.id);
-        if (e.ev === 'send') return model.send(e.chatId, e.text);
-        if (e.ev === 'watch') return model.toggleWatch();
+        model.windowEvent(e);
         if (e.ev !== 'theme' || e.theme === state.overlayTheme) return;
         state.overlayTheme = e.theme;
         saveState(state);
