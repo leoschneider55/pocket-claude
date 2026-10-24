@@ -41,9 +41,11 @@ describe('computer steps for the host', () => {
   it('keep the script ASCII without backticks, so Windows PowerShell reads it as written', () => {
     expect(/[^\x00-\x7f]/.test(COMPUTER_PS)).toBe(false);
     expect(COMPUTER_PS.includes('`')).toBe(false);
-    for (const op of ['screenshot', 'zoom', 'move', 'click', 'button', 'drag', 'scroll', 'type', 'keys', 'cursor', 'windows', 'window', 'open', 'release']) {
+    for (const op of ['screenshot', 'watchSample', 'watchCapture', 'zoom', 'move', 'click', 'button', 'drag', 'scroll', 'type', 'keys', 'cursor', 'windows', 'window', 'open', 'release']) {
       expect(COMPUTER_PS).toContain(`'${op}' {`);
     }
+    expect(COMPUTER_PS).toContain('InputDesktopLocked()');
+    expect(COMPUTER_PS).toContain('StretchBlt(dst, 0, 0, width, height');
   });
 });
 
@@ -107,6 +109,40 @@ describe('ComputerHost', () => {
     expect(second.cmd.op).toBe('windows');
     children[0]!.say({ id: second.id, ok: false, error: 'blocked' });
     await expect(b).rejects.toThrow('blocked');
+  });
+
+  it('uses the persistent host for watch samples and bounded full captures', async () => {
+    const { host, children } = fakeHost();
+    const sample = host.sample(1);
+    await tick();
+    children[0]!.say({ ready: true });
+    await tick();
+    const sampleRequest = children[0]!.requests[0]!;
+    expect(sampleRequest.cmd).toEqual({ op: 'watchSample', display: 1 });
+    children[0]!.say({
+      id: sampleRequest.id,
+      ok: true,
+      result: { locked: false, pixelsBase64: Buffer.alloc(160 * 90).toString('base64'), width: 160, height: 90 },
+    });
+    expect(await sample).toMatchObject({ locked: false, width: 160, height: 90, pixels: expect.any(Uint8Array) });
+
+    const capture = host.capture(0);
+    await tick();
+    const captureRequest = children[0]!.requests[1]!;
+    expect(captureRequest.cmd).toEqual({ op: 'watchCapture', display: 0 });
+    children[0]!.say({
+      id: captureRequest.id,
+      ok: true,
+      result: {
+        locked: false,
+        image: { mime: 'image/jpeg', dataBase64: 'aGVsbG8=', width: 1280, height: 800 },
+        windowTitle: 'Editor',
+        processName: 'editor',
+        display: 0,
+      },
+    });
+    await expect(capture).resolves.toMatchObject({ locked: false, windowTitle: 'Editor', display: 0 });
+    expect(children).toHaveLength(1);
   });
 
   it('restarts the helper after it crashes', async () => {
