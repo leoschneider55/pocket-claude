@@ -3,7 +3,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { ModelInfo, SessionEvent, SessionMeta } from '@pocket/protocol';
+import { DEFAULT_SCREEN_WATCH_SETTINGS, type ModelInfo, type PayloadOf, type SessionEvent, type SessionMeta } from '@pocket/protocol';
 import { firstWords, plural } from '../src/overlay/actions.js';
 import { OverlayModel, SEND_TIMEOUT_MS, whenLabel, type OverlayMessage, type WindowOp } from '../src/overlay/model.js';
 import { OVERLAY_PS, OVERLAY_PS_FILE } from '../src/overlay/script.js';
@@ -11,9 +11,11 @@ import { OVERLAY_PS, OVERLAY_PS_FILE } from '../src/overlay/script.js';
 function setup(now?: () => number) {
   const ops: WindowOp[] = [];
   const requests: string[] = [];
+  const watchRequests: PayloadOf<'screen.watch.set'>[] = [];
   const model = new OverlayModel({
     window: (op) => ops.push(op),
-    request: (b) =>
+    request: (b) => {
+      if (b.type === 'screen.watch.set') watchRequests.push(b.payload);
       requests.push(
         b.type === 'session.history'
           ? `history:${b.payload.sessionId}`
@@ -22,7 +24,8 @@ function setup(now?: () => number) {
             : b.type === 'session.configure'
               ? `configure:${b.payload.sessionId}:${JSON.stringify({ ...b.payload, sessionId: undefined })}`
               : b.type,
-      ),
+      );
+    },
     ...(now ? { now } : {}),
   });
   /** The newest op of a kind: events also refresh the status line and the chat list. */
@@ -32,7 +35,7 @@ function setup(now?: () => number) {
     return found as Extract<WindowOp, { op: K }>;
   }
   const upserts = () => ops.flatMap((o) => (o.op === 'upsert' ? [o.message] : []));
-  return { model, ops, requests, latest, upserts };
+  return { model, ops, requests, watchRequests, latest, upserts };
 }
 
 const meta = (sessionId: string, updatedAt: number, extra: Partial<SessionMeta> = {}): SessionMeta => ({
@@ -54,6 +57,35 @@ function actionsOf(m: OverlayMessage | undefined) {
 }
 
 describe('OverlayModel', () => {
+  it('toggles screen watch for the active chat and renders the returned status', () => {
+    const { model, requests, watchRequests, latest } = setup();
+    model.handle(list(meta('a', 1)));
+    model.windowEvent({ ev: 'watch' });
+    expect(requests.at(-1)).toBe('screen.watch.set');
+    expect(watchRequests).toEqual([{ sessionId: 'a', enabled: true }]);
+
+    model.handle({
+      type: 'screen.watch.status',
+      payload: {
+        sessionId: 'a',
+        watchId: 'watch-1',
+        deviceId: 'pc-1',
+        state: 'watching',
+        settings: DEFAULT_SCREEN_WATCH_SETTINGS,
+      },
+    });
+    expect(latest('status').status).toMatchObject({ watching: true, text: 'готово · 👁 Claude смотрит экран' });
+    model.windowEvent({ ev: 'watch' });
+    expect(requests.at(-1)).toBe('screen.watch.set');
+    expect(watchRequests).toEqual([{ sessionId: 'a', enabled: true }, { sessionId: 'a', enabled: false }]);
+    model.handle({
+      type: 'screen.watch.status',
+      payload: { sessionId: 'a', watchId: 'watch-1', deviceId: 'pc-1', state: 'off', settings: { ...DEFAULT_SCREEN_WATCH_SETTINGS, intervalMs: 2500, maxPerMinute: 2 } },
+    });
+    model.windowEvent({ ev: 'watch' });
+    expect(watchRequests.at(-1)).toEqual({ sessionId: 'a', enabled: true });
+  });
+
   it('asks for the chat list on connect, then follows the most recent visible chat', () => {
     const { model, ops, requests, latest } = setup();
     model.connected();

@@ -33,6 +33,7 @@ import { PC_ALLOWED_TOOLS, pcTools, pcToolsPrompt, type PcHandle } from './pc-to
 import { ATTACHMENTS_DIR, chatFolder, DEFAULT_MAC_WORKSPACE, macSandbox, macWorkspaceFor, ownFolderPrompt, SANDBOX_PROMPT } from './sandbox.js';
 import { readApiKey } from './api-key.js';
 import { ensureSkillsPlugin, paths } from './store.js';
+import { applyWatchCompaction, createWatchFrameRef, prepareWatchCompaction, WatchHistory } from './watch-history.js';
 
 export interface SessionHost {
   executorFor(sessionId: string): ExecutorHandle;
@@ -57,6 +58,14 @@ export interface UserTurn {
   from: string;
   /** Spoken on a call: the reply is read aloud, so it must be short and plain. */
   voice?: boolean;
+  screenFrame?: {
+    image: { mime: 'image/jpeg'; dataBase64: string; width: number; height: number };
+    windowTitle: string;
+    capturedAt: number;
+    frameId: string;
+    retainFrames: number;
+  };
+  observation?: { windowTitle: string; capturedAt: number; goal?: string };
 }
 
 /** Prepended to spoken turns. Claude keeps its tools; only the shape of the answer changes. */
@@ -76,6 +85,7 @@ export const VOICE_NOTE = [
 export { DEFAULT_MAC_WORKSPACE };
 
 const INLINE_TEXT_LIMIT = 200_000;
+const SESSION_START_WAIT_MS = 1_000;
 const isImage = (mime: string) => /^image\/(png|jpe?g|gif|webp)$/i.test(mime);
 const isTextLike = (mime: string, name = '') => /^text\/|json|xml|yaml|javascript|typescript|csv|markdown/i.test(mime) || /\.(txt|md|json|ya?ml|csv|log|ts|tsx|js|jsx|py|cs|java|go|rs|html?|css|sql|sh|ps1|ini|toml|xml)$/i.test(name);
 
@@ -157,6 +167,10 @@ class InputQueue implements AsyncIterable<SDKUserMessage> {
   private waiter: ((r: IteratorResult<SDKUserMessage>) => void) | null = null;
   private done = false;
 
+  get hasPending(): boolean {
+    return this.items.length > 0;
+  }
+
   push(msg: SDKUserMessage): void {
     if (this.waiter) {
       const w = this.waiter;
@@ -183,12 +197,19 @@ class InputQueue implements AsyncIterable<SDKUserMessage> {
   }
 }
 
+interface SessionStartGate {
+  sessionId: string;
+  promise: Promise<void>;
+  resolve: () => void;
+}
+
 /**
  * One chat thread backed by one Claude Code session.
  * The Claude Code process is started lazily and stopped after a period of inactivity; it is resumed by id later.
  */
 export class Session {
   private q: Query | null = null;
+  private pumpPromise: Promise<void> | null = null;
   private input: InputQueue | null = null;
   private abort: AbortController | null = null;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -209,6 +230,9 @@ export class Session {
   private streamedText = false;
   private textBuffer = '';
   private started: boolean;
+  private sendTail: Promise<void> = Promise.resolve();
+  private readonly watchHistory: WatchHistory;
+  private sessionStartGate: SessionStartGate | null = null;
 
   constructor(
     public meta: SessionMeta,
@@ -216,6 +240,7 @@ export class Session {
     resumable: boolean,
   ) {
     this.started = resumable;
+    this.watchHistory = new WatchHistory(join(paths.sessionsDir, meta.sessionId + '.watch-history.json'));
   }
 
   get id(): string {
@@ -314,6 +339,7 @@ export class Session {
     this.destroyed = true;
     if (this.idleTimer) clearTimeout(this.idleTimer);
     rmSync(this.historyFile(), { force: true });
+    this.watchHistory.destroy();
     const folder = chatFolder(this.meta);
     if (existsSync(folder)) log(`chat ${this.id} deleted; its files stay in ${folder}`);
   }
@@ -345,34 +371,140 @@ export class Session {
   }
 
   async send(turn: UserTurn): Promise<void> {
+    const previous = this.sendTail;
+    let release!: () => void;
+    this.sendTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      await this.sendTurn(turn);
+    } finally {
+      release();
+    }
+  }
+
+  private async sendTurn(turn: UserTurn): Promise<void> {
     const attachments = turn.attachments ?? [];
     const images = attachments.filter((a) => isImage(a.mime) && !a.name);
     const files = attachments.filter((a) => !images.includes(a));
+    const imageCount = images.length + (turn.screenFrame ? 1 : 0);
     this.record(
       {
         kind: 'user',
         text: turn.text,
         from: turn.from,
-        ...(images.length ? { images: images.length } : {}),
+        ...(imageCount ? { images: imageCount } : {}),
         ...(files.length ? { files: files.map((f, i) => safeFileName(f.name, `file-${i + 1}`)) } : {}),
         ...(turn.voice ? { voice: true } : {}),
+        ...(turn.observation ? { observation: true } : {}),
       },
       true,
     );
-    this.setMeta({ lastText: turn.text.slice(0, 200) });
+    if (!turn.observation) this.setMeta({ lastText: turn.text.slice(0, 200) });
+    if (!this.q) await this.start();
+    if (turn.screenFrame) await this.trimWatchHistory(Math.max(0, turn.screenFrame.retainFrames - 1));
     if (!this.q) await this.start();
     this.setState('running');
     this.turnStartedAt ??= Date.now();
+    const frameUuid = turn.screenFrame ? randomUUID() : undefined;
     const blocks: Exclude<SDKUserMessage['message']['content'], string> = images.map((img) => ({
       type: 'image' as const,
       source: { type: 'base64' as const, media_type: img.mime as 'image/png', data: img.dataBase64 },
     }));
+    if (turn.screenFrame) {
+      blocks.unshift({
+        type: 'image',
+        source: {
+          type: 'base64',
+          media_type: turn.screenFrame.image.mime,
+          data: turn.screenFrame.image.dataBase64,
+        },
+      });
+    }
     const notes = this.saveFiles(files, blocks);
     const spoken = turn.voice ? `${VOICE_NOTE}\n\n${turn.text}` : turn.text;
     const text = notes.length ? `${spoken}\n\n${notes.join('\n')}` : spoken;
     const content: SDKUserMessage['message']['content'] = blocks.length ? [...blocks, { type: 'text' as const, text }] : text;
-    this.input!.push({ type: 'user', message: { role: 'user', content }, parent_tool_use_id: null, origin: { kind: 'human' } } as SDKUserMessage);
+    const origin = turn.observation ? { kind: 'channel' as const, server: 'pocket-screen-watch' } : { kind: 'human' as const };
+    const message: SDKUserMessage = {
+      type: 'user',
+      message: { role: 'user', content },
+      parent_tool_use_id: null,
+      origin,
+      ...(frameUuid ? { uuid: frameUuid } : {}),
+    };
+    if (turn.screenFrame && frameUuid) {
+      this.watchHistory.record(createWatchFrameRef({
+        uuid: frameUuid,
+        contentIndex: 0,
+        imageIndex: 0,
+        imageBase64: turn.screenFrame.image.dataBase64,
+        windowTitle: turn.screenFrame.windowTitle,
+        capturedAt: turn.screenFrame.capturedAt,
+      }));
+    }
+    this.input!.push(message);
     this.touch();
+  }
+
+  private async trimWatchHistory(retainBeforeNewFrame: number): Promise<void> {
+    const frames = this.watchHistory.framesToCompact(retainBeforeNewFrame);
+    const q = this.q;
+    if (!frames.length || !q || !this.canHousekeep(q)) return;
+    let binding = this.watchHistory.binding();
+    if (!binding) {
+      const engineId = this.meta.engine?.id;
+      if (!engineId) return;
+      await this.waitForSessionStart(engineId);
+      if (!this.canHousekeep(q)) return;
+      binding = this.watchHistory.binding();
+    }
+    if (!binding || binding.sessionId !== this.meta.engine?.id) return;
+
+    const preview = prepareWatchCompaction(binding, frames);
+    if (!preview) return;
+    if (!preview.changed) {
+      if (applyWatchCompaction(preview)) this.watchHistory.forget(frames);
+      return;
+    }
+
+    if (!await this.closeIdleQuery(q)) return;
+    const plan = prepareWatchCompaction(binding, frames);
+    if (plan && applyWatchCompaction(plan)) this.watchHistory.forget(frames);
+    await this.start();
+  }
+
+  private async waitForSessionStart(sessionId: string): Promise<void> {
+    const gate = this.sessionStartGate;
+    if (!gate || gate.sessionId !== sessionId) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      gate.promise,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, SESSION_START_WAIT_MS);
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+  }
+
+  private canHousekeep(q: Query): boolean {
+    return this.q === q && this.meta.state === 'idle' && !this.busy && !this.input?.hasPending;
+  }
+
+  private async closeIdleQuery(q: Query): Promise<boolean> {
+    if (!this.canHousekeep(q)) return false;
+    const input = this.input;
+    const completion = this.pumpPromise;
+    this.q = null;
+    this.input = null;
+    this.abort = null;
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.idleTimer = null;
+    input?.end();
+    q.close();
+    await completion?.catch(() => undefined);
+    return true;
   }
 
   /**
@@ -421,6 +553,8 @@ export class Session {
   stop(): void {
     this.restartAfterTurn = false;
     this.pendingConfig = null;
+    this.sessionStartGate?.resolve();
+    this.sessionStartGate = null;
     this.agents.clear();
     this.input?.end();
     this.abort?.abort();
@@ -471,9 +605,10 @@ export class Session {
     const executor = this.host.executorFor(this.id);
     this.startedOn = executor.id;
     const skillsPlugin = ensureSkillsPlugin();
+    const hostOptions = this.host.claudeOptions();
     const apiKey = this.meta.billing === 'api' ? this.apiKey() : undefined;
     const common: Partial<Options> = {
-      ...this.host.claudeOptions(),
+      ...hostOptions,
       // API billing: Claude Code uses the key instead of the subscription login, straight to api.anthropic.com.
       ...(apiKey ? { env: { ...stringEnv(process.env), ANTHROPIC_API_KEY: apiKey } } : {}),
       ...(this.meta.model ? { model: this.meta.model } : {}),
@@ -538,13 +673,39 @@ export class Session {
     const resume = previous !== undefined && previous.cwd === cwd;
     const engineId = resume ? previous.id : randomUUID();
     this.setMeta({ engine: { id: engineId, cwd } });
+    this.watchHistory.beginSession(engineId);
+    let resolveStart!: () => void;
+    const gate: SessionStartGate = {
+      sessionId: engineId,
+      promise: new Promise<void>((resolve) => {
+        resolveStart = resolve;
+      }),
+      resolve: () => resolveStart(),
+    };
+    this.sessionStartGate = gate;
 
     this.input = new InputQueue();
     this.abort = new AbortController();
     const canUseTool: CanUseTool = (toolName, input, { signal }) => this.host.canUseTool(this.id, toolName, input, signal);
+    const hooks: NonNullable<Options['hooks']> = {
+      ...hostOptions.hooks,
+      SessionStart: [
+        ...(hostOptions.hooks?.SessionStart ?? []),
+        {
+          hooks: [async (input) => {
+            if (input.hook_event_name === 'SessionStart') {
+              this.watchHistory.attachTranscript(input.session_id, input.transcript_path);
+              if (this.sessionStartGate === gate) gate.resolve();
+            }
+            return {};
+          }],
+        },
+      ],
+    };
     const options: Options = {
       ...common,
       ...specific,
+      hooks,
       cwd,
       canUseTool,
       abortController: this.abort,
@@ -552,7 +713,8 @@ export class Session {
     };
     this.started = true;
     this.q = query({ prompt: this.input, options });
-    void this.pump(this.q);
+    this.pumpPromise = this.pump(this.q);
+    void this.pumpPromise;
   }
 
   /** The pc_* and chat_* tools: what Mac and chat-only sessions get. */
@@ -640,6 +802,8 @@ export class Session {
       }
     } finally {
       if (this.q === q) {
+        this.sessionStartGate?.resolve();
+        this.sessionStartGate = null;
         this.q = null;
         this.input = null;
         this.running.clear();

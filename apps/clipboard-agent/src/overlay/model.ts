@@ -1,5 +1,5 @@
 import { applyEvent, buildThread, parseRichMarkdown, type ChatItem, type RichBlock } from '@pocket/client-core';
-import type { InnerMessageBody, ModelInfo, SessionMeta, SessionState } from '@pocket/protocol';
+import type { InnerMessageBody, ModelInfo, ScreenWatchStatus, SessionMeta, SessionState } from '@pocket/protocol';
 import { actionTitle, attachmentsAction, groupOf, runState, toolAction, type ActionState, type OverlayAction, type ToolItem } from './actions.js';
 import { applyPatch, chatConfig, configPatch, patchApplied, type ConfigPatch, type OverlayConfig } from './config.js';
 import type { WindowEvent } from './window.js';
@@ -36,6 +36,7 @@ export type OverlayMessage =
 export interface OverlayStatus {
   text: string;
   tone: OverlayTone;
+  watching?: boolean;
 }
 
 /** One chat in the window's side list. */
@@ -100,6 +101,7 @@ const CONFIG_NO_REPLY = 'Mac не ответил, модель и мышлени
  */
 export class OverlayModel {
   private readonly sessions = new Map<string, SessionMeta>();
+  private readonly watchBySession = new Map<string, ScreenWatchStatus>();
   private readonly threads = new Map<string, ChatItem[]>();
   private readonly loaded = new Set<string>();
   private readonly requested = new Set<string>();
@@ -156,6 +158,7 @@ export class OverlayModel {
     if (e.ev === 'open') this.open(e.id);
     else if (e.ev === 'send') this.send(e.chatId, e.text);
     else if (e.ev === 'configure') this.configure(e.chatId, { model: e.model, effort: e.effort });
+    else if (e.ev === 'watch') this.toggleWatch();
   }
 
   /** The user picked a model or a thinking level for the chat on screen. */
@@ -180,6 +183,16 @@ export class OverlayModel {
     if (error) return this.deps.window({ op: 'unsent', text: body, error });
     this.pending = { chatId, text: body, timer: setTimeout(() => this.unsent(NO_REPLY), SEND_TIMEOUT_MS) };
     this.deps.request({ type: 'message.send', payload: { sessionId: chatId, text: body } });
+  }
+
+  toggleWatch(): void {
+    if (!this.activeId) return;
+    const status = this.watchBySession.get(this.activeId) ?? this.sessions.get(this.activeId)?.watch;
+    const enabled = status?.state !== 'watching' && status?.state !== 'paused';
+    this.deps.request({
+      type: 'screen.watch.set',
+      payload: { sessionId: this.activeId, enabled },
+    });
   }
 
   /** The user picked a chat in the window's list. */
@@ -216,7 +229,11 @@ export class OverlayModel {
     switch (message.type) {
       case 'session.list.result':
         this.sessions.clear();
-        for (const s of message.payload.sessions) if (!s.hidden) this.sessions.set(s.sessionId, s);
+        this.watchBySession.clear();
+        for (const s of message.payload.sessions) {
+          if (s.watch) this.watchBySession.set(s.sessionId, s.watch);
+          if (!s.hidden) this.sessions.set(s.sessionId, s);
+        }
         // After a reconnect the chat being read stays on screen.
         if (this.activeId && this.sessions.has(this.activeId)) this.activate(this.activeId);
         else this.pickActive();
@@ -225,6 +242,7 @@ export class OverlayModel {
         const s = message.payload.session;
         if (s.hidden) return;
         this.sessions.set(s.sessionId, s);
+        if (s.watch) this.watchBySession.set(s.sessionId, s.watch);
         // The phone just opened it: that is where the next messages go.
         this.activate(s.sessionId);
         return;
@@ -233,12 +251,14 @@ export class OverlayModel {
         const s = message.payload.session;
         if (s.hidden) {
           this.sessions.delete(s.sessionId);
+          this.watchBySession.delete(s.sessionId);
           if (this.activeId === s.sessionId) this.pickActive();
           else this.pushChats();
           return;
         }
         const before = this.sessions.get(s.sessionId);
         this.sessions.set(s.sessionId, s);
+        if (s.watch) this.watchBySession.set(s.sessionId, s.watch);
         const pc = this.pendingConfig;
         if (pc && pc.chatId === s.sessionId && patchApplied(s, pc.patch)) {
           clearTimeout(pc.timer);
@@ -260,6 +280,7 @@ export class OverlayModel {
       case 'session.deleted': {
         const id = message.payload.sessionId;
         this.sessions.delete(id);
+        this.watchBySession.delete(id);
         this.threads.delete(id);
         this.loaded.delete(id);
         this.requested.delete(id);
@@ -277,6 +298,14 @@ export class OverlayModel {
         if (sessionId === this.activeId) this.deps.window(this.snapshot());
         return;
       }
+      case 'screen.watch.status': {
+        const status = message.payload;
+        this.watchBySession.set(status.sessionId, status);
+        const meta = this.sessions.get(status.sessionId);
+        if (meta) this.sessions.set(status.sessionId, { ...meta, watch: status });
+        if (status.sessionId === this.activeId) this.pushStatus();
+        return;
+      }
       case 'session.event': {
         const { sessionId, event } = message.payload;
         const meta = this.sessions.get(sessionId);
@@ -284,6 +313,11 @@ export class OverlayModel {
         if (meta) {
           this.sessions.set(sessionId, { ...meta, updatedAt: this.now(), ...(event.kind === 'state' ? { state: event.state } : {}) });
           if (event.kind === 'user' && sessionId !== this.activeId) this.activate(sessionId);
+        }
+        if (event.kind === 'screen_watch') {
+          if (sessionId === this.activeId) this.pushStatus();
+          this.pushChats();
+          return;
         }
         const before = this.threads.get(sessionId) ?? [];
         const after = applyEvent(before, event);
@@ -375,8 +409,11 @@ export class OverlayModel {
   private status(): OverlayStatus {
     if (!this.macOnline) return { text: 'Mac не в сети', tone: 'offline' };
     const meta = this.activeId ? this.sessions.get(this.activeId) : undefined;
-    if (!meta) return { text: '', tone: 'idle' };
-    return sessionStatus(meta.state, this.threads.get(meta.sessionId) ?? []);
+    const status = meta ? sessionStatus(meta.state, this.threads.get(meta.sessionId) ?? []) : { text: '', tone: 'idle' as const };
+    const watch = meta ? this.watchBySession.get(meta.sessionId) ?? meta.watch : undefined;
+    if (watch?.state === 'watching') return { ...status, text: `${status.text ? `${status.text} · ` : ''}👁 Claude смотрит экран`, watching: true };
+    if (watch?.state === 'paused') return { ...status, text: `${status.text ? `${status.text} · ` : ''}👁 Пауза наблюдения`, watching: true };
+    return status;
   }
 
   private chats(): OverlayChat[] {
@@ -461,7 +498,7 @@ export function toMessages(items: ChatItem[], state?: SessionState, only?: (item
       return;
     }
     run = undefined;
-    if (item.type === 'result') return;
+    if (item.type === 'result' || item.type === 'screen_watch') return;
     if (item.type === 'user') replied = false;
     segments.push({ kind: 'single', item, first: item.type === 'assistant' && !replied });
     if (item.type === 'assistant') replied = true;
