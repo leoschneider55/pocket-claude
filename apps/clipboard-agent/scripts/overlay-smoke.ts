@@ -6,7 +6,7 @@
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import type { InnerMessageBody, SessionEvent, SessionMeta } from '@pocket/protocol';
+import type { InnerMessageBody, ModelInfo, SessionEvent, SessionMeta } from '@pocket/protocol';
 import { OverlayModel } from '../src/overlay/model.js';
 import { OVERLAY_PS_FILE } from '../src/overlay/script.js';
 import { OverlayWindow, type WindowEvent } from '../src/overlay/window.js';
@@ -19,7 +19,7 @@ writeFileSync(scriptFile, OVERLAY_PS_FILE);
 const now = Date.now();
 const MAIN = 'chat-fix';
 const sessions: SessionMeta[] = [
-  { sessionId: MAIN, title: 'Краш TypingBubble на Android', state: 'idle', createdAt: now - 3_600_000, updatedAt: now - 60_000, lastText: 'Почини, пожалуйста: приложение вылетает' },
+  { sessionId: MAIN, title: 'Краш TypingBubble на Android', state: 'idle', createdAt: now - 3_600_000, updatedAt: now - 60_000, lastText: 'Почини, пожалуйста: приложение вылетает', model: 'opus', effort: 'max' },
   { sessionId: 'chat-overlay', title: 'Оверлей: читаемый дизайн', state: 'waiting_permission', createdAt: now - 7_200_000, updatedAt: now - 1_800_000, lastText: 'Сделай окно как чат' },
   { sessionId: 'chat-old', title: 'Скриншот экрана ноутбука', state: 'idle', createdAt: now - 3 * 86_400_000, updatedAt: now - 3 * 86_400_000, lastText: 'Что у меня на экране?' },
 ];
@@ -71,9 +71,31 @@ const events: WindowEvent[] = [];
 const problems: string[] = [];
 const waiters: { from: number; pred: (e: WindowEvent) => boolean; done: (e: WindowEvent) => void }[] = [];
 
-/** Plays the brain: lists, histories, and a message typed in the window coming back with Claude's answer. */
+const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
+const models: ModelInfo[] = [
+  { value: 'default', displayName: 'Default (recommended)', description: 'Opus 4.1 for complex work' },
+  { value: 'opus', displayName: 'Opus', description: 'Most capable for complex work', efforts: [...EFFORTS] },
+  { value: 'sonnet', displayName: 'Sonnet', description: 'Fast and capable for everyday tasks', efforts: ['low', 'medium', 'high'] },
+  { value: 'haiku', displayName: 'Haiku', description: 'Fastest for quick answers', efforts: ['low', 'medium', 'high'] },
+];
+const configured: unknown[] = [];
+
+/** Plays the brain: lists, histories, models, a message typed in the window coming back with Claude's answer, model changes. */
 function answer(body: InnerMessageBody): void {
   setTimeout(() => {
+    if (body.type === 'models.get') model.handle({ type: 'models.result', payload: { models } });
+    if (body.type === 'session.configure') {
+      const { sessionId, model: m, effort } = body.payload;
+      configured.push(body.payload);
+      const i = sessions.findIndex((s) => s.sessionId === sessionId);
+      const s = sessions[i];
+      if (!s) return;
+      const next: SessionMeta = { ...s, updatedAt: Date.now() };
+      if (m !== undefined) next.model = m ?? undefined;
+      if (effort !== undefined) next.effort = effort ?? undefined;
+      sessions[i] = next;
+      model.handle({ type: 'session.updated', payload: { session: next } });
+    }
     if (body.type === 'session.list') model.handle({ type: 'session.list.result', payload: { sessions } });
     if (body.type === 'session.history') model.handle({ type: 'session.history.result', payload: { sessionId: body.payload.sessionId, events: histories[body.payload.sessionId] ?? [] } });
     if (body.type === 'message.send') {
@@ -100,8 +122,7 @@ const overlay = new OverlayWindow({
   onEvent: (e) => {
     console.log('event', JSON.stringify(e));
     events.push(e);
-    if (e.ev === 'open') model.open(e.id);
-    if (e.ev === 'send') model.send(e.chatId, e.text);
+    model.windowEvent(e);
     if (e.ev === 'theme') model.setTheme(e.theme);
     for (const w of [...waiters]) {
       if (events.length - 1 < w.from || !w.pred(e)) continue;
@@ -155,6 +176,15 @@ async function click(id: string): Promise<void> {
 async function setValue(id: string, text: string): Promise<void> {
   ps(`${UIA}\n${find(id)}\n$el.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('${text.replace(/'/g, "''")}')`);
   await sleep(400);
+}
+
+function nameOf(id: string): string {
+  return ps(`${UIA}\n${find(id)}\n$el.Current.Name`).trim();
+}
+
+function expectName(id: string, want: string): void {
+  const got = nameOf(id);
+  if (got !== want) problems.push(`${id} reads ${JSON.stringify(got)}, expected ${JSON.stringify(want)}`);
 }
 
 function valueOf(id: string): string {
@@ -253,13 +283,40 @@ async function main(): Promise<void> {
   if (left !== '') problems.push(`the input field still holds ${JSON.stringify(left)} after sending`);
   shot('09-sent');
 
+  // Model and thinking: the chips show the chat's choice, the menus change it, the chat takes it.
+  expectName('model', 'Модель: Opus');
+  expectName('effort', 'Мышление: максимальное');
+  await click('model');
+  shot('10-model-menu');
+  const picked = next((e) => e.ev === 'configure', 3000, 'a model picked in the menu');
+  await click('model:sonnet');
+  const pick = await picked;
+  if (pick.ev !== 'configure' || pick.chatId !== MAIN || pick.model !== 'sonnet') problems.push(`unexpected configure event ${JSON.stringify(pick)}`);
+  await sleep(900);
+  // Sonnet has no "максимальное": the chat gets its nearest level.
+  expectName('model', 'Модель: Sonnet');
+  expectName('effort', 'Мышление: высокое');
+  await click('effort');
+  shot('11-effort-menu');
+  const thought = next((e) => e.ev === 'configure', 3000, 'a thinking level picked in the menu');
+  await click('effort:low');
+  await thought;
+  await sleep(900);
+  expectName('effort', 'Мышление: низкое');
+  const want = [
+    { sessionId: MAIN, model: 'sonnet', effort: 'high' },
+    { sessionId: MAIN, effort: 'low' },
+  ];
+  if (JSON.stringify(configured) !== JSON.stringify(want)) problems.push(`the brain got ${JSON.stringify(configured)}, expected ${JSON.stringify(want)}`);
+  shot('12-picked');
+
   const themed = next((e) => e.ev === 'theme', 3000, 'the theme switch');
   await click('theme');
   await themed;
   await sleep(600);
-  shot('10-light');
+  shot('13-light');
   await click('chats');
-  shot('11-light-chats');
+  shot('14-light-chats');
   await click('chats');
 
   const hidden = next((e) => e.ev === 'visible' && !e.visible, 3000, 'the hide button');

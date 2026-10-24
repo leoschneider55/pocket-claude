@@ -24,13 +24,14 @@ import {
   type SessionState,
   type Subagent,
 } from '@pocket/protocol';
-import { CHAT_ALLOWED_TOOLS, chatTools, chatToolsPrompt, FALLBACK_MODELS, type ChatControl } from './chat-tools.js';
+import { CHAT_ALLOWED_TOOLS, chatTools, chatToolsPrompt, FALLBACK_MODELS, type ChatControl, type ChatPatch } from './chat-tools.js';
 import { computerTools, computerToolsPrompt, ComputerState } from './computer-tools.js';
 import { agentDefinitions, AUTO_ALLOWED_TOOLS, BUILTIN_TOOLS, CLAUDE_TOOLS, claudeTool, readLocalSkillFile, toDisplayCall, TOOL_ALIASES } from './claude-tools.js';
 import type { ExecutorHandle } from './executor.js';
 import { log } from './log.js';
 import { PC_ALLOWED_TOOLS, pcTools, pcToolsPrompt, type PcHandle } from './pc-tools.js';
 import { ATTACHMENTS_DIR, chatFolder, DEFAULT_MAC_WORKSPACE, macSandbox, macWorkspaceFor, ownFolderPrompt, SANDBOX_PROMPT } from './sandbox.js';
+import { readApiKey } from './api-key.js';
 import { ensureSkillsPlugin, paths } from './store.js';
 import { applyWatchCompaction, createWatchFrameRef, prepareWatchCompaction, WatchHistory } from './watch-history.js';
 
@@ -40,6 +41,8 @@ export interface SessionHost {
   pcFor(sessionId: string): PcHandle;
   /** True for chats that run on the Mac without any file or shell access: people who are not the owner and have no tools computer. */
   chatOnly(sessionId: string): boolean;
+  /** Chats of the owner may bill the owner's Anthropic API key; nobody else's may. */
+  ownerChat(sessionId: string): boolean;
   userName(sessionId: string): string;
   emit(sessionId: string, event: SessionEvent, durable: boolean): void;
   metaChanged(meta: SessionMeta): void;
@@ -219,7 +222,7 @@ export class Session {
   private startedOn: string | undefined;
   private restartAfterTurn = false;
   /** Model/effort Claude switched to from inside a turn; the live process takes it when the turn ends. */
-  private pendingConfig: { model?: string | null; effort?: Effort | null } | null = null;
+  private pendingConfig: ChatPatch | null = null;
   /** Which screenshot Claude's computer-use coordinates refer to. */
   private readonly computer = new ComputerState();
   /** Deleted chats must not resurface through late state updates from a stopping process. */
@@ -269,13 +272,21 @@ export class Session {
     return this.turnStartedAt;
   }
 
-  /** Applies model/effort to the live Claude Code process too, without restarting it. */
-  async configure(patch: { model?: string | null; effort?: Effort | null }): Promise<void> {
+  /** Applies model/effort to the live Claude Code process too, without restarting it; billing needs a fresh process. */
+  async configure(patch: ChatPatch): Promise<void> {
     const next: Partial<SessionMeta> = {};
     if (patch.model !== undefined) next.model = patch.model ?? undefined;
     if (patch.effort !== undefined) next.effort = patch.effort ?? undefined;
+    const billingChanged = patch.billing !== undefined && (patch.billing === 'api') !== (this.meta.billing === 'api');
+    if (patch.billing !== undefined) next.billing = patch.billing === 'api' ? 'api' : undefined;
     this.setMeta(next);
     if (!this.q) return;
+    if (billingChanged) {
+      // The key is handed to Claude Code when it starts, so the process starts again (the conversation resumes).
+      if (this.meta.state === 'idle' && !this.busy) this.stop();
+      else this.restartAfterTurn = true;
+      return;
+    }
     try {
       if (patch.model !== undefined) await this.q.setModel(patch.model ?? undefined);
       if (patch.effort !== undefined) await this.q.applyFlagSettings({ effortLevel: patch.effort ?? undefined });
@@ -289,10 +300,11 @@ export class Session {
    * A change Claude asked for itself (chat_configure). The chat shows it at once; the live process takes it when the
    * turn is over, so the model never changes halfway through a tool loop.
    */
-  configureAfterTurn(patch: { model?: string | null; effort?: Effort | null }): void {
+  configureAfterTurn(patch: ChatPatch): void {
     const next: Partial<SessionMeta> = {};
     if (patch.model !== undefined) next.model = patch.model ?? undefined;
     if (patch.effort !== undefined) next.effort = patch.effort ?? undefined;
+    if (patch.billing !== undefined) next.billing = patch.billing === 'api' ? 'api' : undefined;
     this.setMeta(next);
     if (!this.q) return;
     this.pendingConfig = { ...this.pendingConfig, ...patch };
@@ -593,9 +605,17 @@ export class Session {
     const executor = this.host.executorFor(this.id);
     this.startedOn = executor.id;
     const skillsPlugin = ensureSkillsPlugin();
+<<<<<<< HEAD
     const hostOptions = this.host.claudeOptions();
     const common: Partial<Options> = {
       ...hostOptions,
+=======
+    const apiKey = this.meta.billing === 'api' ? this.apiKey() : undefined;
+    const common: Partial<Options> = {
+      ...this.host.claudeOptions(),
+      // API billing: Claude Code uses the key instead of the subscription login, straight to api.anthropic.com.
+      ...(apiKey ? { env: { ...stringEnv(process.env), ANTHROPIC_API_KEY: apiKey } } : {}),
+>>>>>>> origin/main
       ...(this.meta.model ? { model: this.meta.model } : {}),
       ...(this.meta.effort ? { effort: this.meta.effort } : {}),
       settingSources: [],
@@ -707,9 +727,27 @@ export class Session {
     return createSdkMcpServer({ name: MCP_SERVER_NAME, version: '0.1.0', alwaysLoad: true, tools: [...pcTools(() => this.host.pcFor(this.id)), ...computerTools(() => this.host.pcFor(this.id), this.computer), ...chatTools(() => this.chatControl())] });
   }
 
+  /** The owner's key for an API-billed chat; without one (or for someone else's chat) it falls back to the subscription. */
+  private apiKey(): string | undefined {
+    const blocked = this.apiBlocked();
+    const key = blocked ? undefined : readApiKey();
+    if (!key) {
+      log(`session ${this.id}: API billing unavailable (${blocked ?? 'no key'}), using the subscription`);
+      this.setMeta({ billing: undefined });
+    }
+    return key;
+  }
+
+  private apiBlocked(): string | null {
+    if (!this.host.ownerChat(this.id)) return "Only the owner's chats can use the owner's Anthropic API key.";
+    if (!readApiKey()) return 'There is no Anthropic API key on the Mac yet: the owner sets it with `pocket-claude api-key set`.';
+    return null;
+  }
+
   private chatControl(): ChatControl {
     return {
-      current: () => ({ ...(this.meta.model ? { model: this.meta.model } : {}), ...(this.meta.effort ? { effort: this.meta.effort } : {}) }),
+      current: () => ({ ...(this.meta.model ? { model: this.meta.model } : {}), ...(this.meta.effort ? { effort: this.meta.effort } : {}), billing: this.meta.billing === 'api' ? 'api' : 'subscription' }),
+      apiBlocked: () => this.apiBlocked(),
       models: async () => {
         const live = await this.supportedModels().catch(() => null);
         return live?.length ? live : FALLBACK_MODELS;
@@ -949,4 +987,9 @@ function readInstructions(dir: string): string | null {
   } catch {
     return null;
   }
+}
+
+/** process.env without the unset entries, as Claude Code's env option wants plain strings. */
+function stringEnv(env: NodeJS.ProcessEnv): Record<string, string> {
+  return Object.fromEntries(Object.entries(env).filter((e): e is [string, string] => typeof e[1] === 'string'));
 }
