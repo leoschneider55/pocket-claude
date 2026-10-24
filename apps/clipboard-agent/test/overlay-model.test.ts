@@ -3,7 +3,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { DEFAULT_SCREEN_WATCH_SETTINGS, type PayloadOf, type SessionEvent, type SessionMeta } from '@pocket/protocol';
+import { DEFAULT_SCREEN_WATCH_SETTINGS, type ModelInfo, type PayloadOf, type SessionEvent, type SessionMeta } from '@pocket/protocol';
 import { firstWords, plural } from '../src/overlay/actions.js';
 import { OverlayModel, SEND_TIMEOUT_MS, whenLabel, type OverlayMessage, type WindowOp } from '../src/overlay/model.js';
 import { OVERLAY_PS, OVERLAY_PS_FILE } from '../src/overlay/script.js';
@@ -16,7 +16,15 @@ function setup(now?: () => number) {
     window: (op) => ops.push(op),
     request: (b) => {
       if (b.type === 'screen.watch.set') watchRequests.push(b.payload);
-      requests.push(b.type === 'session.history' ? `history:${b.payload.sessionId}` : b.type === 'message.send' ? `send:${b.payload.sessionId}:${b.payload.text}` : b.type);
+      requests.push(
+        b.type === 'session.history'
+          ? `history:${b.payload.sessionId}`
+          : b.type === 'message.send'
+            ? `send:${b.payload.sessionId}:${b.payload.text}`
+            : b.type === 'session.configure'
+              ? `configure:${b.payload.sessionId}:${JSON.stringify({ ...b.payload, sessionId: undefined })}`
+              : b.type,
+      );
     },
     ...(now ? { now } : {}),
   });
@@ -52,7 +60,7 @@ describe('OverlayModel', () => {
   it('toggles screen watch for the active chat and renders the returned status', () => {
     const { model, requests, watchRequests, latest } = setup();
     model.handle(list(meta('a', 1)));
-    model.toggleWatch();
+    model.windowEvent({ ev: 'watch' });
     expect(requests.at(-1)).toBe('screen.watch.set');
     expect(watchRequests).toEqual([{ sessionId: 'a', enabled: true }]);
 
@@ -67,23 +75,23 @@ describe('OverlayModel', () => {
       },
     });
     expect(latest('status').status).toMatchObject({ watching: true, text: 'готово · 👁 Claude смотрит экран' });
-    model.toggleWatch();
+    model.windowEvent({ ev: 'watch' });
     expect(requests.at(-1)).toBe('screen.watch.set');
     expect(watchRequests).toEqual([{ sessionId: 'a', enabled: true }, { sessionId: 'a', enabled: false }]);
     model.handle({
       type: 'screen.watch.status',
       payload: { sessionId: 'a', watchId: 'watch-1', deviceId: 'pc-1', state: 'off', settings: { ...DEFAULT_SCREEN_WATCH_SETTINGS, intervalMs: 2500, maxPerMinute: 2 } },
     });
-    model.toggleWatch();
+    model.windowEvent({ ev: 'watch' });
     expect(watchRequests.at(-1)).toEqual({ sessionId: 'a', enabled: true });
   });
 
   it('asks for the chat list on connect, then follows the most recent visible chat', () => {
     const { model, ops, requests, latest } = setup();
     model.connected();
-    expect(requests).toEqual(['session.list']);
+    expect(requests).toEqual(['session.list', 'models.get']);
     model.handle(list(meta('old', 1), meta('new', 5), meta('hidden', 9, { hidden: true })));
-    expect(requests).toEqual(['session.list', 'history:new']);
+    expect(requests).toEqual(['session.list', 'models.get', 'history:new']);
     expect(latest('reset')).toMatchObject({ chatId: 'new', title: 'Chat new', messages: [], loading: true });
 
     model.handle(history('new', [{ kind: 'user', text: 'hi', from: 'phone' }, { kind: 'text', text: 'Hello `there`' }]));
@@ -240,7 +248,7 @@ describe('OverlayModel', () => {
     expect(latest('reset')).toMatchObject({ chatId: 'b', title: 'Chat b' });
     model.handle({ type: 'session.deleted', payload: { sessionId: 'b' } });
     model.handle({ type: 'session.deleted', payload: { sessionId: 'a' } });
-    expect(ops.at(-1)).toEqual({ op: 'reset', chatId: null, title: 'Чатов пока нет', status: { text: '', tone: 'idle' }, messages: [], chats: [], loading: false, theme: 'dark' });
+    expect(ops.at(-1)).toEqual({ op: 'reset', chatId: null, title: 'Чатов пока нет', status: { text: '', tone: 'idle' }, messages: [], chats: [], loading: false, config: null, theme: 'dark' });
   });
 
   it('lists chats newest first with their state, and opens the one picked in the window', () => {
@@ -282,7 +290,7 @@ describe('OverlayModel', () => {
     model.connected();
     model.handle(list(meta('a', 1), meta('b', 2)));
     expect(latest('reset')).toMatchObject({ chatId: 'a', loading: true });
-    expect(requests).toEqual(['history:b', 'history:a', 'session.list', 'history:a']);
+    expect(requests).toEqual(['history:b', 'history:a', 'session.list', 'models.get', 'history:a']);
     expect(latest('reset').status).toEqual({ text: 'готово', tone: 'idle' });
   });
 
@@ -363,6 +371,132 @@ describe('writing from the window', () => {
   });
 });
 
+const MODELS: ModelInfo[] = [
+  { value: 'default', displayName: 'Default (recommended)', description: 'Opus for complex work' },
+  { value: 'opus', displayName: 'Opus', description: 'Most capable', efforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
+  { value: 'sonnet', displayName: 'Sonnet', description: 'Everyday tasks', efforts: ['low', 'medium', 'high'] },
+];
+const modelsResult = { type: 'models.result' as const, payload: { models: MODELS } };
+
+describe('model and thinking', () => {
+  afterEach(() => vi.useRealTimers());
+
+  it('shows the pickers of the chat on screen once the Mac lists its models', () => {
+    const { model, requests, latest } = setup();
+    model.connected();
+    expect(requests).toEqual(['session.list', 'models.get']);
+    model.handle(list(meta('a', 2, { model: 'opus', effort: 'max' }), meta('b', 1, { model: 'sonnet' })));
+    expect(latest('reset').config).toBeNull();
+    model.handle(modelsResult);
+    const config = latest('config').config;
+    expect(config?.model).toEqual({
+      title: 'Модель',
+      label: 'Opus',
+      options: [
+        { value: 'default', label: 'По умолчанию', detail: 'Opus for complex work', selected: false },
+        { value: 'opus', label: 'Opus', detail: 'Most capable', selected: true },
+        { value: 'sonnet', label: 'Sonnet', detail: 'Everyday tasks', selected: false },
+      ],
+    });
+    expect(config?.effort.title).toBe('Мышление');
+    expect(config?.effort.label).toBe('максимальное');
+    expect(config?.effort.options.map((o) => [o.value, o.label, o.selected])).toEqual([
+      ['auto', 'Авто', false],
+      ['low', 'Низкое', false],
+      ['medium', 'Среднее', false],
+      ['high', 'Высокое', false],
+      ['xhigh', 'Очень высокое', false],
+      ['max', 'Максимальное', true],
+    ]);
+    expect(config?.pending).toBe(false);
+    model.open('b');
+    expect(latest('reset').config).toMatchObject({ model: { label: 'Sonnet' }, effort: { label: 'авто' } });
+  });
+
+  it('switches the model, fits the thinking level to it and waits until the chat has taken it', () => {
+    const { model, requests, latest, ops } = setup();
+    model.handle(list(meta('a', 1, { model: 'opus', effort: 'max' })));
+    model.handle(modelsResult);
+    model.configure('a', { model: 'sonnet' });
+    // Sonnet has no "максимальное": it gets the nearest level it has.
+    expect(requests.at(-1)).toBe('configure:a:{"model":"sonnet","effort":"high"}');
+    const pending = latest('config').config;
+    expect(pending).toMatchObject({ pending: true, model: { label: 'Sonnet' }, effort: { label: 'высокое' } });
+    expect(pending?.effort.options.map((o) => o.value)).toEqual(['auto', 'low', 'medium', 'high']);
+
+    model.handle({ type: 'session.updated', payload: { session: meta('a', 2, { model: 'sonnet', effort: 'high' }) } });
+    expect(latest('config').config).toMatchObject({ pending: false, model: { label: 'Sonnet' }, effort: { label: 'высокое' } });
+    const count = ops.length;
+    model.configure('a', { model: 'sonnet' });
+    model.configure('a', { effort: 'high' });
+    expect(ops).toHaveLength(count);
+
+    model.configure('a', { effort: 'auto' });
+    expect(requests.at(-1)).toBe('configure:a:{"effort":null}');
+    model.handle({ type: 'session.updated', payload: { session: meta('a', 3, { model: 'sonnet' }) } });
+    model.configure('a', { model: 'default' });
+    expect(requests.at(-1)).toBe('configure:a:{"model":null}');
+    model.handle({ type: 'session.updated', payload: { session: meta('a', 4) } });
+    expect(latest('config').config).toMatchObject({ pending: false, model: { label: 'По умолчанию' }, effort: { label: 'авто' } });
+  });
+
+  it('takes picks, messages and chats from the window events', () => {
+    const { model, requests } = setup();
+    model.handle(list(meta('a', 2), meta('b', 1)));
+    model.handle(modelsResult);
+    model.windowEvent({ ev: 'configure', chatId: 'a', model: 'opus' });
+    model.windowEvent({ ev: 'send', chatId: 'a', text: 'hi' });
+    model.windowEvent({ ev: 'open', id: 'b' });
+    model.windowEvent({ ev: 'copied', what: 'code' });
+    expect(requests).toEqual(['history:a', 'configure:a:{"model":"opus"}', 'send:a:hi', 'history:b']);
+  });
+
+  it('follows a change made on the phone', () => {
+    const { model, latest } = setup();
+    model.handle(list(meta('a', 1)));
+    model.handle(modelsResult);
+    model.handle({ type: 'session.updated', payload: { session: meta('a', 2, { model: 'opus', effort: 'low' }) } });
+    expect(latest('config').config).toMatchObject({ model: { label: 'Opus' }, effort: { label: 'низкое' } });
+  });
+
+  it('puts the pickers back and says why when the change does not happen', () => {
+    vi.useFakeTimers();
+    const { model, requests, latest } = setup();
+    model.handle(list(meta('a', 1)));
+    model.handle(modelsResult);
+
+    model.configure('a', { effort: 'low' });
+    expect(latest('config').config).toMatchObject({ pending: true, effort: { label: 'низкое' } });
+    vi.advanceTimersByTime(SEND_TIMEOUT_MS);
+    expect(latest('config').config).toMatchObject({ pending: false, effort: { label: 'авто' } });
+    expect(latest('notice').text).toContain('Mac не ответил, модель и мышление не изменены');
+
+    model.configure('a', { model: 'opus' });
+    model.handle({ type: 'error', payload: { code: 'unknown_session', message: 'Session not found' } });
+    expect(latest('config').config).toMatchObject({ pending: false, model: { label: 'По умолчанию' } });
+    expect(latest('notice').text).toBe('Модель и мышление не изменены: Этого чата нет на Mac');
+
+    model.configure('a', { model: 'sonnet' });
+    model.offline();
+    expect(latest('config').config).toMatchObject({ pending: false, model: { label: 'По умолчанию' } });
+    expect(latest('notice').text).toBe('Mac не в сети, модель и мышление не изменены');
+    model.configure('a', { model: 'sonnet' });
+    model.configure('gone', { model: 'opus' });
+    expect(latest('notice').text).toBe('Этого чата больше нет');
+    expect(requests.filter((r) => r.startsWith('configure:'))).toEqual(['configure:a:{"effort":"low"}', 'configure:a:{"model":"opus"}', 'configure:a:{"model":"sonnet"}']);
+  });
+
+  it('asks for the models again once a turn has ended, when the Mac knows the real list', () => {
+    const { model, requests } = setup();
+    model.connected();
+    model.handle(list(meta('a', 1)));
+    model.handle(history('a', []));
+    model.handle(event('a', { kind: 'result', durationMs: 5 }));
+    model.handle(event('a', { kind: 'result', durationMs: 5 }));
+    expect(requests.filter((r) => r === 'models.get')).toHaveLength(2);
+  });
+});
+
 describe('action labels', () => {
   it('keeps the first three words, the end of long paths and the host of URLs', () => {
     expect(firstWords('pnpm test --filter mobile')).toBe('pnpm test --filter…');
@@ -400,6 +534,7 @@ describe('overlay script', () => {
     expect(OVERLAY_PS).toContain('GetAsyncKeyState');
     expect(OVERLAY_PS).toContain('ShowActivated = false');
     expect(OVERLAY_PS).toContain('Emit("send", "chatId", chatId, "text", text)');
+    expect(OVERLAY_PS).toContain('Emit("configure", "chatId", chatId, kind, value)');
     // Features the .NET Framework C# compiler behind Add-Type does not know.
     expect(OVERLAY_PS).not.toMatch(/\?\.|\$"|nameof\(/);
   });

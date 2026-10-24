@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { CHAT_ALLOWED_TOOLS, chatTools, chatToolsPrompt, FALLBACK_MODELS, fitEffort, resolveModel, type ChatControl } from '../src/chat-tools.js';
+import { CHAT_ALLOWED_TOOLS, chatTools, chatToolsPrompt, describeChatChange, FALLBACK_MODELS, fitEffort, resolveModel, type ChatControl, type ChatPatch } from '../src/chat-tools.js';
 import type { Effort, ModelInfo } from '@pocket/protocol';
 
 const MODELS: ModelInfo[] = [
@@ -9,9 +9,9 @@ const MODELS: ModelInfo[] = [
   { value: 'haiku', displayName: 'Haiku', description: 'Fast', efforts: ['low', 'medium', 'high'] },
 ];
 
-function control(now: { model?: string; effort?: Effort } = {}, models = MODELS) {
-  const patches: { model?: string | null; effort?: Effort | null }[] = [];
-  const c: ChatControl = { current: () => now, models: async () => models, configure: (p) => void patches.push(p) };
+function control(now: { model?: string; effort?: Effort } = {}, models = MODELS, apiBlocked: string | null = null) {
+  const patches: ChatPatch[] = [];
+  const c: ChatControl = { current: () => ({ billing: 'subscription', ...now }), models: async () => models, apiBlocked: () => apiBlocked, configure: (p) => void patches.push(p) };
   const tools = Object.fromEntries(chatTools(() => c).map((t) => [t.name, t]));
   return { tools, patches };
 }
@@ -95,7 +95,28 @@ describe('chat tools', () => {
   it('list the current choice and the models with their levels', async () => {
     const { tools } = control({ model: 'fable', effort: 'max' });
     const r = text(await tools.chat_models!.handler({}, {}));
-    expect(r).toMatch(/^Now: Fable \(fable\), thinking Max\./);
+    expect(r).toMatch(/^Now: Fable \(fable\), thinking Max, billed to the Claude subscription\./);
     expect(r).toMatch(/- Haiku \(haiku\): Fast\. Thinking: low, medium, high/);
+  });
+});
+
+describe('billing', () => {
+  it('switches the chat to the API key and back when asked', async () => {
+    const { tools, patches } = control();
+    const r = await tools.chat_configure!.handler({ billing: 'api', model: 'opus' }, {});
+    expect(r.isError).toBeFalsy();
+    expect(text(r)).toMatch(/Anthropic API key/);
+    expect(patches).toEqual([{ billing: 'api', model: 'opus' }]);
+    await tools.chat_configure!.handler({ billing: 'subscription' }, {});
+    expect(patches[1]).toEqual({ billing: 'subscription' });
+    expect(describeChatChange({ billing: 'api', model: 'opus' })).toBe('model → opus, billing → API');
+  });
+
+  it('refuses the API when the chat may not use the key, and changes nothing', async () => {
+    const { tools, patches } = control({}, MODELS, "Only the owner's chats can use the owner's Anthropic API key.");
+    const r = await tools.chat_configure!.handler({ billing: 'api' }, {});
+    expect(r.isError).toBe(true);
+    expect(text(r)).toMatch(/owner/);
+    expect(patches).toEqual([]);
   });
 });
