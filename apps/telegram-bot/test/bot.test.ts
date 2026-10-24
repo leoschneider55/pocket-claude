@@ -12,7 +12,7 @@ process.env.POCKET_HOME = home;
 process.env.POCKET_LOG_DIR = join(home, 'logs');
 process.env.POCKET_NO_KEYCHAIN = '1';
 
-const { generateIdentity, parsePairingCode, parsePairingUri } = await import('@pocket/protocol');
+const { generateIdentity, parsePairingCode, parsePairingUri, relayPaths } = await import('@pocket/protocol');
 const { DeviceLink, joinAccount } = await import('@pocket/transport');
 const { startNodeRelay } = await import('../../relay/src/node-server.js');
 const { Brain } = await import('../../brain/src/daemon.js');
@@ -28,10 +28,16 @@ let relay: Relay;
 let brain: InstanceType<typeof Brain>;
 const links: InstanceType<typeof DeviceLink>[] = [];
 
-/** The relay learns about a pairing from a frame on the brain's socket; give it a moment before fetching the bundle. */
-const published = async <T>(ticket: T): Promise<T> => {
-  await new Promise((r) => setTimeout(r, 50));
-  return ticket;
+const published = async <T extends { code: string }>(ticket: T): Promise<T> => {
+  const { pairingId } = parsePairingCode(ticket.code);
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    const response = await fetch(new URL(relayPaths.pairingBundle(pairingId), relay.url));
+    if (response.ok) return ticket;
+    if (response.status !== 404) throw new Error(`Pairing publication returned ${response.status}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error('Timed out waiting for pairing publication');
 };
 
 const until = <T>(what: string, fn: (resolve: (v: T) => void) => void, ms = 10_000) =>
@@ -130,7 +136,8 @@ afterAll(async () => {
 describe('PocketBot', () => {
   it('links through a phone code, moves the clipboard both ways and unlinks', async () => {
     let clipboard: ClipboardItem[] = [{ kind: 'text', text: 'hello from windows' }];
-    const pc = await fakeComputer(parsePairingUri(brain.startPairing().uri).code, () => clipboard);
+    const pcTicket = await published(brain.startPairing());
+    const pc = await fakeComputer(parsePairingUri(pcTicket.uri).code, () => clipboard);
     await until<void>('pc known', (ok) => {
       const t = setInterval(() => brain.status().executorOnline && (clearInterval(t), ok()), 25);
     });
@@ -241,7 +248,8 @@ describe('PocketBot', () => {
 
     // A phone asks for the deep link once the daemon knows the bot.
     brain.configureTelegram({ token: '1:test', username: ME.username });
-    const joined = await joinAccount({ relayUrl: relay.url, code: parsePairingUri(brain.startPairing().uri).code, role: 'client', name: 'phone' });
+    const phoneTicket = await published(brain.startPairing());
+    const joined = await joinAccount({ relayUrl: relay.url, code: parsePairingUri(phoneTicket.uri).code, role: 'client', name: 'phone' });
     const phone = new DeviceLink({ relayUrl: relay.url, accountId: joined.bundle.accountId, deviceId: joined.deviceId, role: 'client', identity: joined.identity, peers: { [joined.bundle.brainDeviceId]: joined.bundle.brainEncPub } });
     links.push(phone);
     const inbox: InnerMessage[] = [];

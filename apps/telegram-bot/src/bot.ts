@@ -364,7 +364,7 @@ export class PocketBot {
   /** Waits for the Mac to answer the first status request so computers and the person are known. */
   private ready(l: Linked): Promise<ChatState> {
     return new Promise((resolve) => {
-      const isReady = (s: ChatState) => s.brainOnline && s.host !== null;
+      const isReady = (s: ChatState) => s.brainOnline && s.host !== null && l.client.computersLoaded;
       const done = (s: ChatState) => {
         clearTimeout(timer);
         unsubscribe();
