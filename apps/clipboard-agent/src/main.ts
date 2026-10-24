@@ -122,7 +122,7 @@ async function run(): Promise<void> {
   }
   if (!win) rmSync(pipe, { force: true });
   let agent: ClipboardAgent | undefined;
-  let computer: ComputerHost | undefined;
+  let computerHost: ComputerHost | undefined;
   let overlay: { model: OverlayModel; window: OverlayWindow } | undefined;
   const startOverlay = () => {
     if (overlay || !win) return;
@@ -133,8 +133,13 @@ async function run(): Promise<void> {
       snapshot: () => model.snapshot(),
       log,
       onEvent: (e) => {
+<<<<<<< HEAD
         if (e.ev === 'open') return model.open(e.id);
         if (e.ev === 'send') return model.send(e.chatId, e.text);
+        if (e.ev === 'watch') return model.toggleWatch();
+=======
+        model.windowEvent(e);
+>>>>>>> origin/main
         if (e.ev !== 'theme' || e.theme === state.overlayTheme) return;
         state.overlayTheme = e.theme;
         saveState(state);
@@ -174,14 +179,15 @@ async function run(): Promise<void> {
     process.exit(0);
   });
   server.listen(pipe, () => {
-    if (win && state.computer) {
+    if (win) {
       writeFileSync(files.computer, COMPUTER_PS);
-      computer = new ComputerHost({ script: files.computer, log });
+      computerHost = new ComputerHost({ script: files.computer, log });
     }
     agent = new ClipboardAgent(state, {
       clipboard: win ? windowsClipboard : macClipboard,
       screen: win ? windowsScreen : undefined,
-      computer,
+      computer: state.computer ? computerHost : undefined,
+      watch: computerHost,
       WebSocket: WS,
       log,
       onRelayMoved: (url) => {
@@ -202,7 +208,7 @@ async function run(): Promise<void> {
   const shutdown = () => {
     clearInterval(persist);
     stopOverlay();
-    computer?.close();
+    computerHost?.close();
     if (agent) {
       state.replay = agent.replayState();
       saveState(state);

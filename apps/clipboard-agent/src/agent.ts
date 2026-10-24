@@ -4,6 +4,7 @@ import { DeviceLink, type IncomingMessage, type WebSocketCtor } from '@pocket/tr
 import type { ClipboardBackend } from './clipboard.js';
 import type { ComputerBackend } from './computer.js';
 import type { ScreenBackend } from './screenshot.js';
+import { ScreenWatchController, type ScreenWatchHost } from './watch.js';
 
 export interface AgentState {
   relayUrl: string;
@@ -31,6 +32,7 @@ export interface OverlaySink {
 /** Shares this computer's clipboard and screen with the paired Mac and, when allowed, its mouse and keyboard; no files, no commands. */
 export class ClipboardAgent {
   private readonly link: DeviceLink;
+  private readonly watch: ScreenWatchController | undefined;
   private overlay: OverlaySink | undefined;
 
   constructor(
@@ -41,6 +43,8 @@ export class ClipboardAgent {
       screen?: ScreenBackend;
       /** Computer use: screen, mouse, keyboard and windows; absent means the computer does not offer it. */
       computer?: ComputerBackend;
+      /** Read-only screen watch backed by the persistent Windows computer host. */
+      watch?: ScreenWatchHost;
       WebSocket?: WebSocketCtor;
       log: (m: string) => void;
       /** The relay moved; the caller persists the new address. */
@@ -65,8 +69,21 @@ export class ClipboardAgent {
     this.link.on('presence', (id, online) => {
       if (id !== state.brainDeviceId) return;
       if (online) this.sendStatus();
-      else this.overlay?.offline();
+      else {
+        this.watch?.stop('offline');
+        this.overlay?.offline();
+      }
     });
+    this.watch = opts.watch
+      ? new ScreenWatchController({
+          deviceId: state.deviceId,
+          host: opts.watch,
+          isOnline: () => this.link.isOnline(state.brainDeviceId),
+          sendFrame: (frame) => this.send({ type: 'screen.watch.frame', payload: frame }),
+          sendStatus: (status) => this.onWatchStatus(status),
+          log: opts.log,
+        })
+      : undefined;
   }
 
   connect(): void {
@@ -74,6 +91,7 @@ export class ClipboardAgent {
   }
 
   close(): void {
+    this.watch?.close();
     this.link.close();
   }
 
@@ -87,7 +105,7 @@ export class ClipboardAgent {
     if (this.link.isOnline(this.state.brainDeviceId)) this.sendStatus();
   }
 
-  /** What the overlay asks of the brain: the session list, history, and messages typed in the window. */
+  /** What the overlay asks of the brain: the session list, history, models, messages typed in the window and model changes. */
   request(body: InnerMessageBody): void {
     this.send(body);
   }
@@ -97,9 +115,41 @@ export class ClipboardAgent {
   }
 
   private sendStatus(): void {
-    const capabilities = ['clipboard', ...(this.opts.screen ? ['screenshot'] : []), ...(this.opts.computer ? ['computer'] : []), ...(this.overlay ? ['overlay'] : [])];
-    this.send({ type: 'executor.status', payload: { workspaces: [], os: `${os.platform()} ${os.release()}`, shell: 'none', capabilities } });
+    this.sendExecutorStatus();
     this.overlay?.connected();
+  }
+
+  private sendExecutorStatus(): void {
+    const capabilities = [
+      'clipboard',
+      ...(this.opts.screen ? ['screenshot'] : []),
+      ...(this.opts.computer ? ['computer'] : []),
+      ...(this.overlay ? ['overlay'] : []),
+      ...(this.opts.watch ? ['watch'] : []),
+    ];
+    const watch = this.watch?.status;
+    this.send({
+      type: 'executor.status',
+      payload: {
+        workspaces: [],
+        os: `${os.platform()} ${os.release()}`,
+        shell: 'none',
+        capabilities,
+        ...(watch ? { watch } : {}),
+      },
+    });
+  }
+
+  private onWatchStatus(status: NonNullable<ScreenWatchController['status']>): void {
+    const message = { type: 'screen.watch.status' as const, payload: status };
+    this.overlay?.handle(message);
+    if (!this.link.isOnline(this.state.brainDeviceId)) return;
+    try {
+      this.send(message);
+      this.sendExecutorStatus();
+    } catch (error) {
+      this.opts.log(`screen watch status failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   private async onMessage({ from, message }: IncomingMessage): Promise<void> {
@@ -144,6 +194,7 @@ export class ClipboardAgent {
         if (!this.opts.computer) return this.send({ type: 'computer.done', payload: { requestId, error: 'This computer cannot be controlled: PocketClipboard runs here without computer use.' } });
         if (action.action === 'release') {
           // Not queued behind the step it is meant to stop.
+          this.watch?.stop('killed');
           this.opts.computer.release();
           return this.send({ type: 'computer.done', payload: { requestId, text: 'Let go of all keys and mouse buttons.' } });
         }
@@ -159,7 +210,26 @@ export class ClipboardAgent {
         return;
       }
       case 'control.kill':
+        this.watch?.stop('killed');
         this.opts.computer?.release();
+        return;
+      case 'screen.watch.control':
+        if (this.watch) this.watch.control(message.payload);
+        else this.onWatchStatus({
+          sessionId: message.payload.sessionId,
+          watchId: message.payload.watchId,
+          deviceId: this.state.deviceId,
+          state: 'off',
+          reason: 'error',
+          ...(message.payload.goal ? { goal: message.payload.goal } : {}),
+          settings: message.payload.settings,
+        });
+        return;
+      case 'screen.watch.capture':
+        this.watch?.capture(message.payload.sessionId, message.payload.watchId, message.payload.requestId);
+        return;
+      case 'screen.watch.status':
+        this.overlay?.handle(message);
         return;
       case 'tool.call':
         this.send({ type: 'tool.result', payload: { callId: message.payload.callId, content: 'This computer only shares its clipboard and screen.', isError: true } });
@@ -176,8 +246,12 @@ export class ClipboardAgent {
       case 'session.deleted':
       case 'session.list.result':
       case 'session.history.result':
+      case 'models.result':
       // The brain answers only the overlay's own messages with errors (a chat that is gone, Claude failing to start).
       case 'error':
+        if (message.type === 'session.event' && message.payload.event.kind === 'user') {
+          this.watch?.userActivity(message.payload.sessionId);
+        }
         this.overlay?.handle(message);
         return;
       default:

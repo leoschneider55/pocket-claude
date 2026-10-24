@@ -12,7 +12,7 @@ Everything between devices is end-to-end encrypted; the relay only sees cipherte
 | `apps/relay` | Relay: Cloudflare Worker (`worker.ts`) or Node server (`node-server.ts`) on the same core. Routing, offline queues, pairing. The Node server also serves the Mini App. |
 | `apps/mobile` | Expo / React Native app (Android, iPhone) and, as a web build, the Telegram Mini App. The chat is in Direct. |
 | `apps/executor-extension` | VS Code extension: executes tool calls in the open workspace, has a chat panel. |
-| `apps/clipboard-agent` | `PocketClipboard.exe` for Windows: shares the clipboard with the phone, lends Claude its screen, mouse, keyboard and windows for computer use, and shows the chat with Claude in a small overlay window in the corner, where you can also write to it (double-tap Alt shows it, one Alt tap or Esc hides it; dark or light). |
+| `apps/clipboard-agent` | `PocketClipboard.exe` for Windows: shares the clipboard with the phone, lends Claude its screen, mouse, keyboard and windows for computer use, and shows the chat with Claude in a small overlay window in the corner, where you can also write to it and pick its model and thinking level (double-tap Alt shows it, one Alt tap or Esc hides it; dark or light). |
 | `apps/telegram-bot` | Telegram bot run by the brain daemon (`pocket-claude telegram <token>`): a permanent keyboard for the PC clipboard, screenshots and chats with Claude, “Code → PC” / “Reply → PC” under every reply, one linked account per person; opens the Mini App. |
 | `packages/protocol` | Crypto, envelopes, message schemas, pairing. |
 | `packages/transport` | `DeviceLink` (authenticated, encrypted WebSocket link) and `joinAccount` (pairing). |
@@ -54,7 +54,21 @@ Shell commands of Mac chats run in Claude Code's macOS sandbox (Seatbelt): no pe
 
 With PocketClipboard on a Windows computer, Claude can operate it like a person at the keyboard: "open PowerShell and type `dir`", "open the site in Chrome and see what is wrong with the slide", "close Notepad". The `computer` tool follows Anthropic's computer-use actions (screenshot, clicks, drag, scroll, type, key, zoom, wait) plus windows (list, focus, minimize, maximize, restore, close), `open` for programs, files and URLs, and several displays. Coordinates are pixels of the latest screenshot (one display, up to 1280×800); the Mac maps them to physical pixels, so 125–150 % scaling works, and every action returns a fresh screenshot.
 
+API billing: a chat runs on the Claude subscription; say "switch to the API" (or "переключи на API, Opus") and from the next reply it bills the owner's Anthropic API key instead, straight to api.anthropic.com; "back to the subscription" undoes it. The key lives only in `~/.pocket-claude/anthropic-api-key` (mode 600): `pocket-claude api-key set` (reads it from stdin), `status`, `remove`. Invited people's chats cannot use it.
+
 It is off on every computer until its owner runs `PocketClipboard.exe computer on` there (`computer off` turns it off again), so nobody else's PC can be driven without them. The first action in a chat asks once on the phone, in Telegram or aloud on a call, and covers the whole chat; `pocket-claude allow add computer` allows it for good. ⏹ or the kill switch stops a step midway and lets go of held keys. Windows does not let a normal program type into windows running as administrator, UAC prompts or the lock screen. Rebuild and reinstall `PocketClipboard.exe` (`apps/clipboard-agent/scripts/build-exe.sh`) to get it.
+
+## Screen watch — «Claude смотрит»
+
+Use **👁 Смотреть экран** in a chat, on the call screen, or in the Windows overlay. Voice requests such as “смотри за экраном”, “хватит смотреть” and “скажи, когда закончится сборка” use `screen_watch`. Watching belongs to one chat and its selected Windows PC, never another person's computer.
+
+PocketClipboard compares small frames locally in its persistent PowerShell host. Only a settled, significant change sends a JPEG up to 1280×800, with the foreground window/process and changed area, over the existing E2E channel to the Mac. Images are not written to the PC's disk. Empty or `[quiet]` observations are neither shown nor spoken.
+
+Defaults are a 1-second sample interval (configurable from 0.5 to 3 seconds), 1.5-second settling, and hard ceilings of 4 observation turns per minute and 60 per hour. Exceeding a limit pauses observation with a notice. Watching stops after 15 minutes without a user message, on lock/sleep, PC disconnection, or the kill switch; reconnecting does not restart it.
+
+User messages automatically receive a frame no older than 10 seconds, requesting a fresh one when needed. Only **watch** images age out of Claude's context (2 turns by default). Ordinary `pc_screenshot`, `computer` screenshots/zoom, and user attachments keep their existing quality and history. Claude can zoom or take a manual screenshot when a watch frame is too small to read. On calls, observations wait for a conversational pause and play a short signal before speaking.
+
+Update brain, mobile and PocketClipboard together. Real capture, lock/sleep, idle CPU and native call audio need the Windows/phone acceptance checks in [TZ-vision.md](TZ-vision.md); Linux/web tests cannot prove them.
 
 ## Telegram Mini App
 
