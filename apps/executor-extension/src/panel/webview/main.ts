@@ -185,6 +185,8 @@ function renderItem(item: ChatItem): HTMLElement {
       return renderAssistant(item.text, item.streaming);
     case 'tool':
       return renderTool(item);
+    case 'screen_watch':
+      return h('div', 'meta', item.text);
     case 'result':
       return h('div', 'meta', formatResultLine(item.durationMs, item.costUsd));
     case 'error':
