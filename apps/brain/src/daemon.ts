@@ -380,7 +380,7 @@ export class Brain {
     return !caps || caps.includes('tools');
   }
 
-  /** PocketClipboard with the overlay window: it mirrors the chat on screen, reads sessions and writes text into them. */
+  /** PocketClipboard with the overlay window: it mirrors the chat on screen, reads sessions, writes text into them and sets their model. */
   private isOverlay(deviceId: string): boolean {
     return !!this.executor.info(deviceId)?.capabilities?.includes('overlay');
   }
@@ -675,6 +675,7 @@ export class Brain {
           if (!s || this.userOfSession(s.id) !== device.userId) return this.sendError(from, 'unknown_session', 'Session not found');
           return this.sendTurn(s, { text: message.payload.text, from }, from);
         }
+<<<<<<< HEAD
         case 'screen.watch.set': {
           if (!this.isOverlay(from)) return;
           const s = this.sessions.get(message.payload.sessionId);
@@ -683,6 +684,17 @@ export class Brain {
             return this.sendError(from, 'computer_not_selected', 'Select this computer for the chat before enabling screen watching');
           }
           return this.applyWatchRequest(from, device.userId, message.payload);
+=======
+        case 'models.get':
+          if (this.isOverlay(from)) this.link.send(from, { type: 'models.result', payload: { models: await this.listModels() } });
+          return;
+        case 'session.configure': {
+          // The window's model and thinking pickers, for its person's chats.
+          if (!this.isOverlay(from)) return;
+          const s = this.sessions.get(message.payload.sessionId);
+          if (!s || this.userOfSession(s.id) !== device.userId) return this.sendError(from, 'unknown_session', 'Session not found');
+          return this.configureSession(s, message.payload);
+>>>>>>> origin/main
         }
         default:
           return;
@@ -744,9 +756,7 @@ export class Brain {
       case 'session.configure': {
         const s = mySession(message.payload.sessionId);
         if (!s) return this.sendError(from, 'unknown_session', 'Session not found');
-        const model = message.payload.model === 'default' ? null : message.payload.model;
-        await s.configure({ model, effort: message.payload.effort });
-        return;
+        return this.configureSession(s, message.payload);
       }
       case 'session.hide':
         mySession(message.payload.sessionId)?.setHidden(message.payload.hidden);
@@ -916,6 +926,11 @@ export class Brain {
     };
   }
 
+  /** 'default' is the model list's name for no particular model. */
+  private configureSession(s: Session, p: PayloadOf<'session.configure'>): Promise<void> {
+    return s.configure({ model: p.model === 'default' ? null : p.model, effort: p.effort });
+  }
+
   /** Starts a turn; if Claude cannot start, the device that wrote hears about it. */
   private async sendTurn(s: Session, turn: UserTurn, from: string): Promise<void> {
     const watchTurn = turn as WatchUserTurn;
@@ -960,6 +975,7 @@ export class Brain {
         ),
       pcFor: (sessionId: string) => this.pcHandle(sessionId),
       chatOnly: (sessionId: string) => this.chatOnly(sessionId),
+      ownerChat: (sessionId: string) => this.isOwner(this.userOfSession(sessionId)),
       userName: (sessionId: string) => this.userName(this.userOfSession(sessionId)),
       emit: (sessionId: string, event: SessionEvent, durable: boolean) => this.emitEvent(sessionId, event, durable),
       metaChanged: (meta: SessionMeta) => {
