@@ -1,4 +1,4 @@
-import { newMessageId, type ClipboardItem, type Computer, type Project, type Effort, type Identity, type InnerMessageBody, type ModelInfo, type PayloadOf, type PermissionDecision, type ScreenImage, type SessionEvent, type SessionMeta } from '@pocket/protocol';
+import { newMessageId, type ClipboardItem, type Computer, type Project, type Effort, type Identity, type InnerMessageBody, type ModelInfo, type PayloadOf, type PermissionDecision, type ScreenImage, type ScreenWatchSettings, type ScreenWatchStatus, type SessionEvent, type SessionMeta } from '@pocket/protocol';
 import { DeviceLink, type IncomingMessage, type WebSocketCtor } from '@pocket/transport';
 import { applyEvent, buildThread, type ChatItem } from './thread.js';
 
@@ -93,10 +93,12 @@ const INITIAL: ChatState = {
 export class ChatClient {
   private readonly link: DeviceLink;
   private state: ChatState = INITIAL;
+  private receivedComputers = false;
   private readonly listeners = new Set<(s: ChatState) => void>();
   /** Streamed text waiting to be applied: deltas are batched so the UI re-renders a few times a second, not on every word. */
   private pendingDelta: { sessionId: string; text: string; timer: ReturnType<typeof setTimeout> } | null = null;
   private readonly pendingCreate: ((id: string) => void)[] = [];
+  private readonly pendingWatchStatuses = new Map<string, ScreenWatchStatus>();
   private readonly clipboardWaiters = new Map<string, { resolve: (items: ClipboardItem[]) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   private readonly screenWaiters = new Map<string, { resolve: (image: ScreenImage) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
 
@@ -113,12 +115,17 @@ export class ChatClient {
       log: opts.log,
     });
     this.link.on('ready', (_roster, online) => {
+      this.receivedComputers = false;
       this.patch({ connection: 'online', brainOnline: online.includes(opts.brainDeviceId) });
       this.request({ type: 'status.get', payload: {} });
     });
-    this.link.on('disconnected', () => this.patch({ connection: 'offline', brainOnline: false }));
+    this.link.on('disconnected', () => {
+      this.receivedComputers = false;
+      this.patch({ connection: 'offline', brainOnline: false });
+    });
     this.link.on('presence', (deviceId, online) => {
       if (deviceId !== opts.brainDeviceId) return;
+      this.receivedComputers = false;
       this.patch({ brainOnline: online });
       if (online) this.request({ type: 'status.get', payload: {} });
     });
@@ -130,6 +137,10 @@ export class ChatClient {
 
   get deviceId(): string {
     return this.opts.deviceId;
+  }
+
+  get computersLoaded(): boolean {
+    return this.receivedComputers;
   }
 
   connect(): void {
@@ -161,7 +172,7 @@ export class ChatClient {
 
   /** Seeds the model from a cached snapshot so the UI has something to show before the brain answers. */
   hydrate(snapshot: Pick<ChatState, 'sessions' | 'threads'>): void {
-    this.patch({ sessions: snapshot.sessions, threads: snapshot.threads });
+    this.patch({ sessions: snapshot.sessions.map((meta) => this.mergeWatchStatus(meta)), threads: snapshot.threads });
   }
 
   snapshot(): Pick<ChatState, 'sessions' | 'threads'> {
@@ -189,6 +200,31 @@ export class ChatClient {
 
   send(sessionId: string, text: string, attachments?: { mime: string; dataBase64: string; name?: string }[], opts: { voice?: boolean } = {}): boolean {
     return this.request({ type: 'message.send', payload: { sessionId, text, ...(attachments?.length ? { attachments } : {}), ...(opts.voice ? { voice: true } : {}) } });
+  }
+
+  /** Watch control is scoped to the chat; the brain resolves its selected executor and owning person. */
+  setScreenWatch(sessionId: string, enabled: boolean, options: { goal?: string; settings?: Partial<ScreenWatchSettings> } = {}): boolean {
+    if (!this.state.sessions.some((s) => s.sessionId === sessionId)) {
+      this.patch({ lastError: 'Chat not found' });
+      return false;
+    }
+    if (enabled && !this.canWatchScreen(sessionId)) {
+      this.patch({ lastError: 'The selected PC is offline or does not support screen watching' });
+      return false;
+    }
+    return this.request({
+      type: 'screen.watch.set',
+      payload: { sessionId, enabled, ...(options.goal !== undefined ? { goal: options.goal } : {}), ...(options.settings ? { settings: options.settings } : {}) },
+    });
+  }
+
+  /** True only for this chat's selected PC (or the account default when the chat has no explicit selection). */
+  canWatchScreen(sessionId: string): boolean {
+    const session = this.state.sessions.find((s) => s.sessionId === sessionId);
+    if (!session) return false;
+    const deviceId = session.executorId ?? this.state.activeComputer;
+    const computer = deviceId ? this.state.computers.find((c) => c.deviceId === deviceId) : undefined;
+    return computer?.online === true && computer.capabilities?.includes('watch') === true;
   }
 
   interrupt(sessionId: string): boolean {
@@ -325,6 +361,7 @@ export class ChatClient {
   }
 
   private forgetSession(sessionId: string): void {
+    this.pendingWatchStatuses.delete(sessionId);
     const { [sessionId]: _thread, ...threads } = this.state.threads;
     const { [sessionId]: _loaded, ...loaded } = this.state.loaded;
     this.patch({
@@ -386,6 +423,9 @@ export class ChatClient {
   }
 
   kill(): boolean {
+    for (const session of this.state.sessions) {
+      if (session.watch && session.watch.state !== 'off') this.request({ type: 'screen.watch.set', payload: { sessionId: session.sessionId, enabled: false } });
+    }
     return this.request({ type: 'control.kill', payload: { scope: 'all' } });
   }
 
@@ -405,7 +445,7 @@ export class ChatClient {
       case 'host.status':
         return this.patch({ host: message.payload, brainOnline: true });
       case 'session.list.result':
-        return this.patch({ sessions: sortSessions(message.payload.sessions) });
+        return this.patch({ sessions: sortSessions(message.payload.sessions.map((meta) => this.mergeWatchStatus(meta))) });
       case 'session.created': {
         this.upsertSession(message.payload.session);
         this.patch({ loaded: { ...this.state.loaded, [message.payload.session.sessionId]: true } });
@@ -447,6 +487,7 @@ export class ChatClient {
       case 'activity.result':
         return this.patch({ activity: message.payload });
       case 'computers.result': {
+        this.receivedComputers = true;
         const known = new Set(this.state.computers.map((c) => c.deviceId));
         const added = this.state.pairing && message.payload.computers.some((c) => !known.has(c.deviceId));
         return this.patch({
@@ -475,6 +516,14 @@ export class ChatClient {
         else w.reject(new Error(message.payload.error ?? 'No image'));
         return;
       }
+      case 'screen.watch.status': {
+        const session = this.state.sessions.find((s) => s.sessionId === message.payload.sessionId);
+        if (!session) {
+          this.pendingWatchStatuses.set(message.payload.sessionId, message.payload);
+          return;
+        }
+        return this.upsertSession({ ...session, watch: message.payload });
+      }
       case 'relay.moved':
         if (this.opts.followRelayMoves === false || !isRelayUrl(message.payload.url) || message.payload.url === this.link.currentRelayUrl) return;
         this.link.setRelayUrl(message.payload.url);
@@ -486,8 +535,19 @@ export class ChatClient {
   }
 
   private upsertSession(meta: SessionMeta): void {
+    meta = this.mergeWatchStatus(meta);
     const others = this.state.sessions.filter((s) => s.sessionId !== meta.sessionId);
     this.patch({ sessions: sortSessions([...others, meta]) });
+  }
+
+  private mergeWatchStatus(meta: SessionMeta): SessionMeta {
+    const pending = this.pendingWatchStatuses.get(meta.sessionId);
+    if (pending) {
+      this.pendingWatchStatuses.delete(meta.sessionId);
+      return { ...meta, watch: pending };
+    }
+    const current = this.state.sessions.find((s) => s.sessionId === meta.sessionId)?.watch;
+    return meta.watch === undefined && current ? { ...meta, watch: current } : meta;
   }
 
   private applySessionEvent(sessionId: string, event: SessionEvent): void {
