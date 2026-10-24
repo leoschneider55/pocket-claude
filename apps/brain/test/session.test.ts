@@ -74,6 +74,7 @@ function host(over: Partial<Host> = {}): Host {
     metaChanged: (m) => void metas.push(m),
     canUseTool: async (_s, _t, input) => ({ behavior: 'allow', updatedInput: input }),
     claudeOptions: () => ({}),
+    ownerChat: () => true,
     onClaudeVersion: () => {},
     ...over,
   };
