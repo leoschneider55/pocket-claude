@@ -12,6 +12,8 @@ export type WindowEvent =
   | { ev: 'open'; id: string }
   /** The user wrote a message to the chat on screen. */
   | { ev: 'send'; chatId: string; text: string }
+  /** The user picked a model ('default' for the default) or a thinking level ('auto' for the model's own). */
+  | { ev: 'configure'; chatId: string; model?: string; effort?: string }
   | { ev: 'error'; message: string };
 
 export interface OverlayWindowOptions {

@@ -1,7 +1,7 @@
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { InnerMessage, PairingCode } from '@pocket/protocol';
+import type { InnerMessage, PairingCode, SessionMeta } from '@pocket/protocol';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 // The brain reads its home from the environment at import time.
@@ -168,5 +168,45 @@ describe('overlay executors', () => {
     await new Promise((r) => setTimeout(r, 300));
     expect(phone.inbox.filter(userEvent('sneaky'))).toEqual([]);
     expect(plain.inbox.filter((m) => m.type === 'error' || m.type.startsWith('session.'))).toEqual([]);
+  });
+
+  it("lets an overlay list models and set a chat's model and thinking, and no plain computer", async () => {
+    const overlay = await connect('executor', 'picking-pc');
+    const plain = await connect('executor', 'idle-pc');
+    const phone = await connect('client', 'phone-3');
+    overlay.send({ type: 'executor.status', payload: { workspaces: [], os: 'win32', shell: 'none', capabilities: ['clipboard', 'overlay'] } });
+    plain.send({ type: 'executor.status', payload: { workspaces: [], os: 'win32', shell: 'none', capabilities: ['clipboard'] } });
+    await until<void>('both computers known', (ok) => {
+      const t = setInterval(() => {
+        const list = [...phone.inbox].reverse().find((m) => m.type === 'computers.result');
+        const ids = list?.type === 'computers.result' ? list.payload.computers.map((c) => c.deviceId) : [];
+        if (ids.includes(overlay.deviceId) && ids.includes(plain.deviceId)) (clearInterval(t), ok());
+      }, 25);
+    });
+    phone.send({ type: 'session.create', payload: { title: 'Pick a model' } });
+    const created = await overlay.next('session.created', (m) => m.type === 'session.created' && m.payload.session.title === 'Pick a model');
+    const sessionId = created.type === 'session.created' ? created.payload.session.sessionId : '';
+
+    overlay.send({ type: 'models.get', payload: {} });
+    const models = await overlay.next('models.result');
+    expect(models.type === 'models.result' && models.payload.models.map((m) => m.value)).toContain('opus');
+
+    const updated = (check: (s: SessionMeta) => boolean) => (m: InnerMessage) => m.type === 'session.updated' && m.payload.session.sessionId === sessionId && check(m.payload.session);
+    overlay.send({ type: 'session.configure', payload: { sessionId, model: 'opus', effort: 'max' } });
+    await phone.next('session.updated', updated((s) => s.model === 'opus' && s.effort === 'max'));
+    // The overlay sees the chat take the change: that is how its pickers know it went through.
+    await overlay.next('session.updated', updated((s) => s.model === 'opus' && s.effort === 'max'));
+    overlay.send({ type: 'session.configure', payload: { sessionId, model: 'default', effort: null } });
+    await overlay.next('session.updated', updated((s) => s.model === undefined && s.effort === undefined));
+
+    overlay.send({ type: 'session.configure', payload: { sessionId: 'no-such-chat', model: 'opus' } });
+    const error = await overlay.next('error', (m) => m.type === 'error' && m.payload.code === 'unknown_session');
+    expect(error.type === 'error' && error.payload).toEqual({ code: 'unknown_session', message: 'Session not found' });
+
+    plain.send({ type: 'models.get', payload: {} });
+    plain.send({ type: 'session.configure', payload: { sessionId, model: 'haiku' } });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(phone.inbox.filter(updated((s) => s.model === 'haiku'))).toEqual([]);
+    expect(plain.inbox.filter((m) => m.type === 'models.result' || m.type === 'error')).toEqual([]);
   });
 });
