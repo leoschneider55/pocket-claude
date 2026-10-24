@@ -91,6 +91,7 @@ function isWatchFrameRef(value: unknown): value is WatchFrameRef {
     /^[0-9a-f]{64}$/.test(value.imageHash) &&
     typeof value.windowTitle === 'string' &&
     value.windowTitle.length <= MAX_WINDOW_TITLE_LENGTH &&
+    cleanWindowTitle(value.windowTitle) === value.windowTitle &&
     typeof value.capturedAt === 'number' &&
     Number.isFinite(value.capturedAt) &&
     Math.abs(value.capturedAt) <= 8.64e15
